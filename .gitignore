@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables & secrets (CRITICAL)
+.env
+*.env.local
+
+# Testing & Cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor & OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime workdir & large CAD / binary data
+backend/work/
+backend/data/*.db*
+*.dwg
+*.dxf
+*.log
