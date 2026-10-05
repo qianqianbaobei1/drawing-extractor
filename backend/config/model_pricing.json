@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "timezone": "Asia/Shanghai",
+  "models": {
+    "deepseek-flash": {
+      "effective_from": "2026-09-10T12:00:00+08:00",
+      "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+      "source_note": "DeepSeek V4.1 Flash; prices in CNY per 1,000,000 tokens. Peak hours exclude statutory holidays; calendar overrides are not bundled.",
+      "peak": {"cache_hit": 0.04, "cache_miss": 2.0, "output": 8.0},
+      "off_peak": {"cache_hit": 0.02, "cache_miss": 1.0, "output": 4.0},
+      "peak_windows": [
+        {"weekdays": [0, 1, 2, 3, 4], "start": "09:00", "end": "12:00"},
+        {"weekdays": [0, 1, 2, 3, 4], "start": "14:00", "end": "18:00"}
+      ]
+    }
+  },
+  "aliases": {
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash"
+  }
+}

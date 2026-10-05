@@ -22,7 +22,9 @@ from typing import Any
 import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE, "data")
+# 数据目录必须认 EXTRACTOR_DATA_DIR：测试跑的就是这里，不隔离就会往运营正式库里写测试项目与任务。
+# 与 store.py 保持同一种写法，不要一处认环境变量、一处写死。
+DATA_DIR = os.path.abspath(os.environ.get("EXTRACTOR_DATA_DIR") or os.path.join(BASE, "data"))
 DB_PATH = os.path.join(DATA_DIR, "extractor.db")
 
 _local = threading.local()
@@ -202,9 +204,29 @@ def _init_tables(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN raw_json TEXT DEFAULT '{}';")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN ai_usage_json TEXT DEFAULT '{}';")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_tenant ON jobs(tenant_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(tenant_id, project_name);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);")
+
+        # 项目主表的工程信息列（需求：上传图纸后自动建项目并存入从图纸提取的项目信息）
+        for column, ddl in (
+            ("project_code", "TEXT DEFAULT ''"),
+            ("client_name", "TEXT DEFAULT ''"),
+            ("designer_institute", "TEXT DEFAULT ''"),
+            ("location", "TEXT DEFAULT ''"),
+            ("status", "TEXT DEFAULT 'active'"),
+            ("note", "TEXT DEFAULT ''"),
+            ("name_source", "TEXT DEFAULT ''"),
+            ("info_json", "TEXT DEFAULT '{}'"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE projects ADD COLUMN {column} {ddl};")
+            except sqlite3.OperationalError:
+                pass
 
         # 5. AI 调用审计与计费账本 (逐笔原子记账)
         conn.execute("""
@@ -253,7 +275,12 @@ def _init_tables(conn: sqlite3.Connection) -> None:
         INSERT OR IGNORE INTO tenants (id, name, status, created_at)
         VALUES ('default', '电柜智核成套电气工程部', 'active', datetime('now', 'localtime'));
         """)
-        initial_admin_pass = os.environ.get("ADMIN_INITIAL_PASSWORD") or "admin123"
+        if os.environ.get("ENV") == "production" and not os.environ.get("ADMIN_INITIAL_PASSWORD"):
+            import secrets
+            initial_admin_pass = secrets.token_urlsafe(16)
+            print(f"[SECURITY ALERT] 生产环境检测到未配置 ADMIN_INITIAL_PASSWORD，已自动生成初始管理员安全密码: {initial_admin_pass}")
+        else:
+            initial_admin_pass = os.environ.get("ADMIN_INITIAL_PASSWORD") or "admin123"
         admin_hash = _hash_password(initial_admin_pass)
         conn.execute("""
         INSERT OR IGNORE INTO users (id, tenant_id, username, password_hash, display_name, role, created_at)
@@ -326,9 +353,18 @@ def db_save_job(job: dict) -> None:
     now_str = _now()
     created_at = job.get("created_at") or now_str
 
-    summary_str = _safe_json_dumps(job.get("summary") or {})
+    summary = dict(job.get("summary") or {})
+    if "sheet_names" in job and job["sheet_names"]:
+        summary["sheet_names"] = job["sheet_names"]
+    if "file_type" in job and job["file_type"]:
+        summary["file_type"] = job["file_type"]
+    if "target_brand" in job and job["target_brand"]:
+        summary["target_brand"] = job["target_brand"]
+
+    summary_str = _safe_json_dumps(summary)
     data_str = _safe_json_dumps(job.get("data") or {})
     raw_str = _safe_json_dumps(job.get("raw") or {})
+    ai_usage_str = _safe_json_dumps(job.get("ai_usage") or {})
 
     raw_changes = job.get("changes") or []
     if isinstance(raw_changes, list):
@@ -342,8 +378,8 @@ def db_save_job(job: dict) -> None:
     with conn:
         conn.execute("""
         INSERT INTO jobs (id, tenant_id, user_id, project_name, filename, status, progress,
-                          pages, box_code, summary_json, data_json, changes_json, raw_json, error, changes, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          pages, box_code, summary_json, data_json, changes_json, raw_json, ai_usage_json, error, changes, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             tenant_id = excluded.tenant_id,
             user_id = excluded.user_id,
@@ -357,13 +393,14 @@ def db_save_job(job: dict) -> None:
             data_json = excluded.data_json,
             changes_json = excluded.changes_json,
             raw_json = CASE WHEN excluded.raw_json != '{}' THEN excluded.raw_json ELSE jobs.raw_json END,
+            ai_usage_json = CASE WHEN excluded.ai_usage_json != '{}' THEN excluded.ai_usage_json ELSE jobs.ai_usage_json END,
             error = excluded.error,
             changes = excluded.changes,
             updated_at = excluded.updated_at;
         """, (
             job_id, tenant_id, user_id, p_name, job.get("filename", ""),
             status, job.get("progress", 0), job.get("pages", 1),
-            job.get("box_code", ""), summary_str, data_str, changes_json_str, raw_str,
+            job.get("box_code", ""), summary_str, data_str, changes_json_str, raw_str, ai_usage_str,
             job.get("error", ""), changes_count,
             created_at, now_str
         ))
@@ -438,6 +475,19 @@ def _row_to_job(row: sqlite3.Row) -> dict:
         raw = json.loads(row["raw_json"] or "{}") if "raw_json" in row.keys() else {}
     except Exception:
         raw = {}
+    try:
+        ai_usage = json.loads(row["ai_usage_json"] or "{}") if "ai_usage_json" in row.keys() else {}
+        if not isinstance(ai_usage, dict):
+            ai_usage = {}
+    except Exception:
+        ai_usage = {}
+    if not ai_usage and isinstance(summary, dict) and summary.get("ai_usage"):
+        ai_usage = summary["ai_usage"]
+
+    sheet_names = summary.get("sheet_names") or {}
+    file_type = summary.get("file_type") or ""
+    target_brand = summary.get("target_brand") or "正泰"
+
     return {
         "id": row["id"],
         "job_id": row["id"],
@@ -445,6 +495,9 @@ def _row_to_job(row: sqlite3.Row) -> dict:
         "user_id": row["user_id"],
         "project": row["project_name"],
         "filename": row["filename"],
+        "file_type": file_type,
+        "target_brand": target_brand,
+        "sheet_names": sheet_names,
         "status": row["status"],
         "progress": row["progress"],
         "pages": row["pages"],
@@ -452,6 +505,7 @@ def _row_to_job(row: sqlite3.Row) -> dict:
         "summary": summary,
         "data": data,
         "raw": raw,
+        "ai_usage": ai_usage,
         "error": row["error"],
         "changes": changes,
         "created_at": row["created_at"],
@@ -469,13 +523,65 @@ def db_ensure_project(name: str, tenant_id: str | None = None) -> dict:
     now_str = _now()
     conn = _get_conn()
     with conn:
+        # name_source 显式给空串：空表示“还没定来源”，由上传流程或人工去填。
+        # 若这里留成有值，自动建项目时就分不清“系统命名”还是“人工命名”了。
         conn.execute("""
-        INSERT OR IGNORE INTO projects (id, tenant_id, name, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?);
+        INSERT OR IGNORE INTO projects (id, tenant_id, name, name_source, created_at, updated_at)
+        VALUES (?, ?, ?, '', ?, ?);
         """, (f"{t_id}:{name}", t_id, name, now_str, now_str))
         cur = conn.execute("SELECT * FROM projects WHERE tenant_id = ? AND name = ?", (t_id, name))
         row = cur.fetchone()
         return dict(row) if row else {"name": name, "created_at": now_str}
+
+
+def db_update_project(name: str, patch: dict, tenant_id: str | None = None) -> dict | None:
+    """更新项目工程信息（编号/建设单位/设计单位/状态/备注等）。只允许白名单列。
+
+    返回更新后的行；项目不存在返回 None。改名不走这里：name 是 jobs 与 ai_logs 的关联键，
+    必须用 db_rename_project 一起改。
+    """
+    allowed = ("project_code", "client_name", "designer_institute", "location",
+               "status", "note", "name_source")
+    fields = {k: patch[k] for k in allowed if k in patch and patch[k] is not None}
+    if "info_json" in patch and patch["info_json"] is not None:
+        fields["info_json"] = (patch["info_json"] if isinstance(patch["info_json"], str)
+                               else _safe_json_dumps(patch["info_json"]))
+    t_id = tenant_id or get_current_tenant()
+    conn = _get_conn()
+    existing = conn.execute("SELECT id FROM projects WHERE tenant_id = ? AND name = ?",
+                            (t_id, name)).fetchone()
+    if not existing:
+        return None
+    if fields:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with conn:
+            conn.execute(f"UPDATE projects SET {sets}, updated_at = ? WHERE tenant_id = ? AND name = ?",
+                         (*fields.values(), _now(), t_id, name))
+    row = conn.execute("SELECT * FROM projects WHERE tenant_id = ? AND name = ?", (t_id, name)).fetchone()
+    return dict(row) if row else None
+
+
+def db_rename_project(old_name: str, new_name: str, tenant_id: str | None = None) -> dict:
+    """项目改名：projects / jobs / ai_logs 三处一起改，避免关联键不一致留下孤儿数据。"""
+    old_name = (old_name or "").strip()
+    new_name = (new_name or "").strip()
+    if not old_name or not new_name:
+        raise ValueError("项目名称不能为空")
+    t_id = tenant_id or get_current_tenant()
+    conn = _get_conn()
+    if conn.execute("SELECT 1 FROM projects WHERE tenant_id = ? AND name = ?", (t_id, new_name)).fetchone():
+        raise ValueError(f"项目「{new_name}」已存在，请换一个名称或先合并")
+    with conn:
+        conn.execute("UPDATE projects SET name = ?, id = ?, updated_at = ? WHERE tenant_id = ? AND name = ?",
+                     (new_name, f"{t_id}:{new_name}", _now(), t_id, old_name))
+        conn.execute("UPDATE jobs SET project_name = ? WHERE tenant_id = ? AND project_name = ?",
+                     (new_name, t_id, old_name))
+        conn.execute("UPDATE ai_logs SET project_name = ? WHERE tenant_id = ? AND project_name = ?",
+                     (new_name, t_id, old_name))
+        # 导出历史也要跟着改：历史页的「回到项目」直接拿这列当跳转参数
+        conn.execute("UPDATE export_history SET project_name = ? WHERE tenant_id = ? AND project_name = ?",
+                     (new_name, t_id, old_name))
+    return {"old_name": old_name, "name": new_name}
 
 
 def db_list_projects(tenant_id: str | None = None) -> list[dict]:
@@ -798,7 +904,7 @@ def db_logout_user(token: str) -> bool:
     return True
 
 
-def db_clean_all_test_data() -> dict:
+def db_clean_all_test_data(work_dir: str | None = None) -> dict:
     """清空系统内所有测试数据（jobs、projects、ai_logs、export_history、work 目录临时文件）。"""
     conn = _get_conn()
     with conn:
@@ -827,10 +933,11 @@ def db_clean_all_test_data() -> dict:
     except Exception:
         pass
 
-    # 清空 backend/work 目录下的全部临时测试文件
-    work_dir = os.path.join(BASE, "work")
+    # Filesystem cleanup is opt-in at the caller boundary. Tests often use a
+    # temporary database; defaulting to the real backend/work here let a test
+    # clear endpoint delete a developer's local drawings and exports.
     deleted_files = 0
-    if os.path.isdir(work_dir):
+    if work_dir and os.path.isdir(work_dir):
         for item in os.listdir(work_dir):
             item_path = os.path.join(work_dir, item)
             try:
@@ -855,4 +962,3 @@ def db_clean_all_test_data() -> dict:
 
 # 初始化
 init_db()
-

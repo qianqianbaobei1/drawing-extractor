@@ -5,3 +5,4 @@ PyMuPDF>=1.24
 openpyxl>=3.1
 python-multipart>=0.0.9
 python-dotenv>=1.0
+ezdxf>=1.3

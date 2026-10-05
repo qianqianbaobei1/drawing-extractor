@@ -38,14 +38,12 @@ if _orig_get_glyph_path:
 
     ttfonts.TTFontRenderer.get_glyph_path = _safe_get_glyph_path
 
-MAX_TEXT_ENTITIES_LIMIT = 25000
+from .config import domain as _domain_top, pipeline as _pipeline_top
 
-SYSTEM_KEYWORDS_INCLUDE = [
-    "系统图", "接线图", "原理图", "干线图", "拓扑图", "一次图", "二次图", "结线图"
-]
-SYSTEM_KEYWORDS_EXCLUDE = [
-    "平面图", "布置图", "接地平面", "防雷平面", "电缆敷设", "管线综合", "抗震说明", "设计说明", "图纸目录", "防爆区域划分"
-]
+MAX_TEXT_ENTITIES_LIMIT = int(_pipeline_top()["cad"]["max_text_entities_limit"])
+
+SYSTEM_KEYWORDS_INCLUDE = list(_domain_top()["cad"]["system_keywords_include"])
+SYSTEM_KEYWORDS_EXCLUDE = list(_domain_top()["cad"]["system_keywords_exclude"])
 
 
 def is_cad_path(path: str) -> bool:
@@ -56,11 +54,7 @@ def is_cad_path(path: str) -> bool:
 
 def find_dwg2dxf_tool() -> str | None:
     """查找系统中可用的 dwg2dxf 工具路径。"""
-    common_paths = [
-        "/opt/homebrew/bin/dwg2dxf",
-        "/usr/local/bin/dwg2dxf",
-        "/usr/bin/dwg2dxf",
-    ]
+    common_paths = list(DWG2DXF_SEARCH_PATHS)
     for p in common_paths:
         if os.path.exists(p) and os.access(p, os.X_OK):
             return p
@@ -69,11 +63,7 @@ def find_dwg2dxf_tool() -> str | None:
 
 def find_dwg2svg_tool() -> str | None:
     """查找系统中可用的 dwg2SVG 工具路径。"""
-    common_paths = [
-        "/opt/homebrew/bin/dwg2SVG",
-        "/usr/local/bin/dwg2SVG",
-        "/usr/bin/dwg2SVG",
-    ]
+    common_paths = list(DWG2SVG_SEARCH_PATHS)
     for p in common_paths:
         if os.path.exists(p) and os.access(p, os.X_OK):
             return p
@@ -143,7 +133,7 @@ def load_dxf_document(dxf_path: str):
 def is_system_title(text: str) -> bool:
     """判断文字是否属于电气系统图标题。"""
     t = text.replace(" ", "").replace("\n", "").strip()
-    if not t or len(t) > 35:
+    if not t or len(t) > NOTE_TEXT_MAX_LEN:
         return False
     # 排除说明句式标点
     if any(p in t for p in ["。", "；", "，", ";", ","]):
@@ -182,7 +172,7 @@ def detect_system_sheets(doc: Any) -> list[dict[str, Any]]:
                         "x": float(e.dxf.insert.x),
                         "y": float(e.dxf.insert.y),
                         "layer": str(getattr(e.dxf, "layer", "")),
-                        "height": float(getattr(e.dxf, "height", 10.0) if e.dxftype() == "TEXT" else getattr(e.dxf, "char_height", 10.0)),
+                        "height": float(getattr(e.dxf, "height", UNIT_CAPTION_DEFAULT_HEIGHT) if e.dxftype() == "TEXT" else getattr(e.dxf, "char_height", UNIT_CAPTION_DEFAULT_HEIGHT)),
                     })
         except Exception:
             pass
@@ -201,7 +191,7 @@ def detect_system_sheets(doc: Any) -> list[dict[str, Any]]:
                         "x": float(attrib.dxf.insert.x) if hasattr(attrib.dxf, "insert") else ins_x,
                         "y": float(attrib.dxf.insert.y) if hasattr(attrib.dxf, "insert") else ins_y,
                         "layer": ins_layer,
-                        "height": float(getattr(attrib.dxf, "height", 20.0)),
+                        "height": float(getattr(attrib.dxf, "height", BLOCK_TEXT_DEFAULT_HEIGHT)),
                     })
         except Exception:
             pass
@@ -209,10 +199,10 @@ def detect_system_sheets(doc: Any) -> list[dict[str, Any]]:
     if not candidates:
         return []
 
-    # 3. 过滤图纸目录表（同一 X 轴紧密垂直堆叠，avg dy < 4000）
+    # 3. 过滤图纸目录表（同一 X 轴紧密垂直堆叠）
     by_x: dict[int, list[dict[str, Any]]] = {}
     for c in candidates:
-        bucket = round(c["x"] / 2000) * 2000
+        bucket = round(c["x"] / TEXT_ROW_BUCKET) * TEXT_ROW_BUCKET
         by_x.setdefault(bucket, []).append(c)
 
     filtered = []
@@ -221,7 +211,7 @@ def detect_system_sheets(doc: Any) -> list[dict[str, Any]]:
             ys = sorted([g["y"] for g in group])
             diffs = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
             avg_diff = sum(diffs) / len(diffs)
-            if avg_diff < 4000:
+            if avg_diff < TEXT_ROW_ALIGN_TOL:
                 continue
         filtered.extend(group)
 
@@ -229,17 +219,18 @@ def detect_system_sheets(doc: Any) -> list[dict[str, Any]]:
         return []
 
     # 4. 去重并优先选取图签栏或大字高标题
+    title_layer_scores = _DOM.get("title_layer_score_hints") or {}
+    title_text_score = int(_DOM.get("title_text_score") or 0)
     sheet_map: dict[str, dict[str, Any]] = {}
     for c in filtered:
         name = c["title"]
         score = 0
         layer_upper = (c.get("layer") or "").upper()
-        if any(k in layer_upper for k in ["图签", "图框", "TITLE", "PUB_TITLE", "BORDER"]):
-            score += 20
-        elif any(k in layer_upper for k in ["PUB_TEXT", "TEXT", "TXT", "NOTE"]):
-            score += 10
-        if c["height"] >= 300:
-            score += 5
+        matched = [v for k, v in title_layer_scores.items() if k in layer_upper]
+        if matched:
+            score += max(matched)
+        if c["height"] >= TITLE_TEXT_MIN_HEIGHT:
+            score += title_text_score
         if name not in sheet_map or score > sheet_map[name]["score"]:
             c["score"] = score
             sheet_map[name] = c
@@ -261,27 +252,28 @@ def detect_system_sheets(doc: Any) -> list[dict[str, Any]]:
                 min_px, max_px = min(xs), max(xs)
                 min_py, max_py = min(ys), max(ys)
                 pw, ph = max_px - min_px, max_py - min_py
-                if pw > 1000 and ph > 600:
+                if pw > BLOCK_PLAN_MIN_W and ph > BLOCK_PLAN_MIN_H:
                     aspect = max(pw, ph) / min(pw, ph)
-                    if 1.2 <= aspect <= 1.8:
+                    if BLOCK_PLAN_ASPECT_MIN <= aspect <= BLOCK_PLAN_ASPECT_MAX:
                         border_boxes.append((min_px, min_py, max_px, max_py))
         except Exception:
             pass
 
     # 7. 计算每张图框的实际包围盒 (Bounding Box)
-    sheet_w = 118900.0
+    sheet_w = SHEET_DEFAULT_WIDTH
     if len(detected) >= 2:
         xs = sorted(s["x"] for s in detected)
-        diffs = [xs[i + 1] - xs[i] for i in range(len(xs) - 1) if xs[i + 1] - xs[i] >= 80000]
+        diffs = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)
+                 if xs[i + 1] - xs[i] >= SHEET_WIDTH_GAP_MIN]
         if diffs:
             sheet_w = min(diffs)
     elif len(detected) == 1:
         # 单图自适应比例尺推导 (根据大字高推算 scale)
-        th = detected[0].get("height", 10.0)
-        scale = max(1.0, th / 3.5) if th > 15 else 1.0
-        sheet_w = 1189.0 * scale
+        th = detected[0].get("height", UNIT_CAPTION_DEFAULT_HEIGHT)
+        scale = max(1.0, th / SHEET_SCALE_REFERENCE_HEIGHT) if th > SHEET_SCALE_TEXT_HEIGHT else 1.0
+        sheet_w = SHEET_WIDTH_MM_BASIS * scale
 
-    sheet_h = sheet_w / 1.414  # ISO 216 标准宽高比 1.414
+    sheet_h = sheet_w / SHEET_ASPECT_RATIO  # ISO 216 标准宽高比
 
     for s in detected:
         tx, ty = s["x"], s["y"]
@@ -308,7 +300,7 @@ def slice_and_render_cad_sheets(doc: Any, sheets: list[dict[str, Any]], out_pdf_
     """针对检测出的多个电气系统图进行单图框矢量切片与拼接，输出高清多页 PDF 与对应文字元数据。
 
     采用空间网格索引 (Spatial Grid Indexing) 与电气实体预剪枝，消除无用图元遍历，
-    并发多线程极速渲染，保障工业级超大 DWG 秒级稳定切片。
+    并发渲染以改善复杂图纸处理速度；实际耗时与完整性需按图纸逐类测量。
     """
     msp = doc.modelspace()
     combined_pdf = pymupdf.open()
@@ -323,7 +315,7 @@ def slice_and_render_cad_sheets(doc: Any, sheets: list[dict[str, Any]], out_pdf_
     }
 
     # 2. 空间网格索引加速 (Cell Size 35000)
-    CELL_SIZE = 35000.0
+    CELL_SIZE = float(_CAD["cell_size"])
     grid: dict[tuple[int, int], list[tuple[Any, float, float]]] = {}
 
     for e in msp:
@@ -344,7 +336,7 @@ def slice_and_render_cad_sheets(doc: Any, sheets: list[dict[str, Any]], out_pdf_
         sheet_name = sheet["title"]
         bx0, by0, bx1, by1 = sheet["bbox"]
 
-        # 从空间网格中仅提取与当前图框相交单元格的实体（亚毫秒级检索）
+        # 从空间网格中筛选与当前图框相交单元格的实体，减少无关图元遍历。
         min_gx, max_gx = int(bx0 // CELL_SIZE), int(bx1 // CELL_SIZE)
         min_gy, max_gy = int(by0 // CELL_SIZE), int(by1 // CELL_SIZE)
 
@@ -397,7 +389,7 @@ def slice_and_render_cad_sheets(doc: Any, sheets: list[dict[str, Any]], out_pdf_
             print(f"[CAD] 单页切片渲染降级 (sheet={sheet_name}): {render_err}")
             # 容错降级：生成标准 A3 白色图纸占位页，保证包含提取的图框名称
             fallback_doc = pymupdf.open()
-            fb_page = fallback_doc.new_page(width=1190, height=842)
+            fb_page = fallback_doc.new_page(width=RENDER_FALLBACK_PAGE[0], height=RENDER_FALLBACK_PAGE[1])
             fb_page.insert_text((50, 50), f"系统图: {sheet_name} (矢量渲染降级)", fontsize=18)
             page_bytes = fallback_doc.convert_to_pdf()
 
@@ -430,48 +422,83 @@ def slice_and_render_cad_sheets(doc: Any, sheets: list[dict[str, Any]], out_pdf_
 # ---------------------------------------------------------------------------
 # v2 流水线：按真实图框几何分幅，再把每张系统图拆成配电箱单元块
 #
-# 旧流水线用“系统图”标题文字的插入点 + 猜出来的图纸尺寸当切片边界，后果是：
-#   1. 图框真实尺寸靠 X 间距最小值猜，实测猜成 49868 而真实幅面是 118900，
-#      每张图被砍掉约一半幅面；
-#   2. 实体只按 dxf.insert / dxf.start 归属，CIRCLE / ARC / SOLID / LWPOLYLINE /
-#      POLYLINE 没有这些属性，被整类丢弃（39MB 实测丢 16,506 个），箱体轮廓、
-#      母线、圆形仪表符号全部消失；
-#   3. 一张 A0 系统图上排着十几个配电箱，整张当一个单元送模型，输出超 12000 token
-#      被截断（任务 3bda9d34ccac 第 8 页就是这么失败的）；
-#   4. 图签栏里的图名文字被当成独立图纸，页数与真实图纸数对不上。
+# 旧流水线用“系统图”标题文字的插入点和估算尺寸当切片边界，可能裁掉页面内容；
+#   2. 实体只按 dxf.insert / dxf.start 归属会漏掉不含这些属性的圆弧、实体和多段线；
+#   3. 多箱系统图整页送模型可能超过输出上限，需拆分并校验跨边界对象；
+#   4. 图签栏里的图名文字可能被误当成独立图纸，导致页数与源图不符。
 #
-# v2 改成：图框块参照（INSERT）给出精确幅面 -> 图名文字分系统图/平面图 -> 系统图内部
-# 按“虚线箱框 + 箱名”配对出配电箱单元块 -> 每个单元块一页 PDF，附该块的原生 CAD 文字。
+# v2 尝试：用图框块参照（INSERT）识别幅面、用标题分类图纸，再按箱框与箱名生成单元块。
+# 该启发式仍依赖图框/图层/标注习惯，输出需经过切片覆盖检查；单元块边界不保证无遗漏。
 # ---------------------------------------------------------------------------
+# 几何判据与领域词典全部来自 config/pipeline.json 的 cad 段与 config/domain.json，
+# 现场按设计院习惯调整时改 JSON（或设同名环境变量）即可，不必改代码。
+# ---------------------------------------------------------------------------
+from .config import domain as _domain, pipeline as _pipeline  # noqa: E402
 
-ISO_LANDSCAPE_SIZES = (
-    (1189.0, 841.0), (841.0, 594.0), (594.0, 420.0), (420.0, 297.0), (297.0, 210.0),
-)
-FRAME_MIN_DIM = 30000.0            # 闭合多段线外框的最小边长（图纸单位）
-FRAME_MIN_SIDE = 15000.0           # 块参照图框的最小短边；再小的只能是图签/箱框/符号
-FRAME_MAX_ASPECT = 2.8             # 长宽比超过此值的是桥架/母线这类长条符号，不是图纸
-FRAME_DEDUP_TOL = 0.02             # 面积容差：落在已知图框内部 98% 的候选视为嵌套子块
-UNIT_RECT_MIN_W, UNIT_RECT_MAX_W = 3500.0, 48000.0
-UNIT_RECT_MIN_H, UNIT_RECT_MAX_H = 3000.0, 52000.0
-UNIT_CAPTION_SUFFIX = ("配电箱", "配电柜", "控制箱", "端子箱", "电表箱", "配电屏", "开关箱", "电源箱")
-UNIT_CAPTION_BAD_LAYERS = {
-    "TEL_TAB", "TEL_TITLE", "表格文字", "图框层3", "WORK", "PUB_TITLE", "图签栏", "DIM-照明",
-}
+_CAD = _pipeline()["cad"]
+_DOM = _domain()["cad"]
+
+ISO_LANDSCAPE_SIZES = tuple(tuple(pair) for pair in _CAD["iso_landscape_sizes"])
+FRAME_MIN_DIM = float(_CAD["frame_min_dim"])            # 闭合多段线外框的最小边长（图纸单位）
+FRAME_MIN_SIDE = float(_CAD["frame_min_side"])          # 块参照图框的最小短边
+FRAME_MAX_ASPECT = float(_CAD["frame_max_aspect"])      # 超过此长宽比的是长条符号，不是图纸
+FRAME_DEDUP_TOL = float(_CAD["frame_dedup_tol"])        # 面积容差：落在大框内即视为嵌套子块
+FRAME_DUP_TOL = float(_CAD["frame_dup_tol"])
+UNIT_RECT_MIN_W, UNIT_RECT_MAX_W = float(_CAD["unit_rect_min_w"]), float(_CAD["unit_rect_max_w"])
+UNIT_RECT_MIN_H, UNIT_RECT_MAX_H = float(_CAD["unit_rect_min_h"]), float(_CAD["unit_rect_max_h"])
+UNIT_RECT_DEDUP_TOL = float(_CAD["unit_rect_dedup_tol"])
+RECT_ASPECT_MIN, RECT_ASPECT_MAX = float(_CAD["rect_aspect_min"]), float(_CAD["rect_aspect_max"])
+POLYLINE_CLOSE_TOL = float(_CAD["polyline_close_tol"])
+TEXT_ROW_BUCKET = float(_CAD["text_row_bucket"])
+TEXT_ROW_ALIGN_TOL = float(_CAD["text_row_align_tol"])
+TITLE_TEXT_MIN_HEIGHT = float(_CAD["title_text_min_height"])
+SHEET_DEFAULT_WIDTH = float(_CAD["sheet_default_width"])
+SHEET_WIDTH_MM_BASIS = float(_CAD["sheet_width_mm_basis"])
+SHEET_ASPECT_RATIO = float(_CAD["sheet_aspect_ratio"])
+SHEET_SCALE_TEXT_HEIGHT = float(_CAD["sheet_scale_text_height"])
+SHEET_SCALE_REFERENCE_HEIGHT = float(_CAD["sheet_scale_reference_height"])
+SHEET_WIDTH_GAP_MIN = float(_CAD["sheet_width_gap_min"])
+FALLBACK_TEXT_HEIGHT = float(_CAD["fallback_text_height"])
+UNIT_CAPTION_DEFAULT_HEIGHT = float(_CAD["unit_caption_default_height"])
+BLOCK_TEXT_DEFAULT_HEIGHT = float(_CAD["block_text_default_height"])
+CROP_OVERLAP_RATIO = float(_CAD["crop_overlap_ratio"])
+CROP_WIDTH_FACTOR = float(_CAD["crop_width_factor"])
+CROP_HEIGHT_RATIO = float(_CAD["crop_height_ratio"])
+CROP_TOP_MAX_PAD = float(_CAD["crop_top_max_pad"])
+CROP_CAPTION_GAP = float(_CAD["crop_caption_gap"])
+CROP_CAPTION_GAP_ALT = float(_CAD["crop_caption_gap_alt"])
+CROP_BOTTOM_GAP = float(_CAD["crop_bottom_gap"])
+CROP_BELOW_PAD = float(_CAD["crop_below_pad"])
+CELL_SIZE = float(_CAD["cell_size"])
+BLOCK_PLAN_MIN_W = float(_CAD["block_plan_min_w"])
+BLOCK_PLAN_MIN_H = float(_CAD["block_plan_min_h"])
+BLOCK_PLAN_ASPECT_MIN = float(_CAD["block_plan_aspect_min"])
+BLOCK_PLAN_ASPECT_MAX = float(_CAD["block_plan_aspect_max"])
+RENDER_FALLBACK_PAGE = tuple(_CAD["render_fallback_page"])
+DWG2DXF_SEARCH_PATHS = tuple(_CAD["dwg2dxf_search_paths"])
+DWG2SVG_SEARCH_PATHS = tuple(_CAD["dwg2svg_search_paths"])
+CONVERT_TIMEOUT_S = int(_CAD["convert_timeout_s"])
+UNIT_CAPTION_SUFFIX = tuple(_DOM["unit_caption_suffix"])
+UNIT_CAPTION_MIN_LEN = int(_DOM["box_caption_min_len"])
+UNIT_CAPTION_MAX_LEN = int(_DOM["box_caption_max_len"])
+BOX_TITLE_MAX_LEN = int(_DOM["box_title_max_len"])
+NOTE_TEXT_MAX_LEN = int(_DOM["note_text_max_len"])
+UNIT_CAPTION_BAD_LAYERS = set(_DOM["unit_caption_bad_layers"])
 # 平面图/建筑图层上也有闭合箱柜外形，但不是系统图单元块，按图层前缀排掉
-UNIT_RECT_BAD_LAYER_MARKERS = ("EQUIP", "WIRE", "BEAM", "平面", "门窗", "建筑", "TEL", "FURN",
-                               "DIM", "HATCH", "看线", "天棚", "楼面", "环境", "暖通")
-BOX_ABOVE_MIN, BOX_ABOVE_MAX = 2000.0, 7000.0   # 箱名文字到上方箱框底边的距离窗口
-BOX_X_TOLERANCE = 5000.0                       # 箱名与箱框水平中心的最大额外偏移
-CROP_PAD_SIDE, CROP_PAD_TOP, CROP_PAD_BOTTOM = 500.0, 600.0, 2600.0
-PAGE_LONG_MM_MIN, PAGE_LONG_MM_MAX = 240.0, 1600.0
+UNIT_RECT_BAD_LAYER_MARKERS = tuple(_DOM["unit_rect_bad_layer_markers"])
+BOX_ABOVE_MIN, BOX_ABOVE_MAX = float(_CAD["box_above_min"]), float(_CAD["box_above_max"])
+BOX_X_TOLERANCE = float(_CAD["box_x_tolerance"])       # 箱名与箱框水平中心的最大额外偏移
+CROP_PAD_SIDE = float(_CAD["crop_pad_side"])
+CROP_PAD_TOP = float(_CAD["crop_pad_top"])
+CROP_PAD_BOTTOM = float(_CAD["crop_pad_bottom"])
+PAGE_LONG_MM_MIN, PAGE_LONG_MM_MAX = float(_CAD["page_long_mm_min"]), float(_CAD["page_long_mm_max"])
 # 配电箱单元块的页面长边固定到 A3 左右：下游按“长边 2400px”光栅化，
-# 长边落在 240~320mm 才能既拿满像素又不触发大图分块（>320mm 会被再切成 4 块）。
-UNIT_PAGE_LONG_MM = 297.0
-PLAN_TITLE_MARKERS = ("平面图", "布置图", "剖面", "详图", "设计说明", "图纸目录", "目录",
-                      "防雷平面", "接地平面", "地坪", "屋面", "立管", "门窗表")
-SYSTEM_TITLE_MARKERS = ("系统图", "干线图", "原理图", "拓扑图", "接线图", "结线图", "配电图")
-TITLE_LAYER_HINTS = ("图签", "TITLE", "PUB_", "图框", "图名")
-GRID_CELL = 40000.0
+# 长边落在触发阈值以下才能既拿满像素又不触发再分块。
+UNIT_PAGE_LONG_MM = float(_CAD["unit_page_long_mm"])
+PLAN_TITLE_MARKERS = tuple(_DOM["plan_title_markers"])
+SYSTEM_TITLE_MARKERS = tuple(_DOM["system_title_markers"])
+TITLE_LAYER_HINTS = tuple(_DOM["title_layer_hints"])
+GRID_CELL = float(_CAD["grid_cell"])
 
 
 def _entity_bounds(entity: Any) -> tuple[float, float, float, float] | None:
@@ -674,14 +701,14 @@ def detect_drawing_frames(doc: Any, index: GeometryIndex) -> list[dict[str, Any]
                         is_closed = True
                     else:
                         pts = e.get_points("xy")
-                        if len(pts) >= 4 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < 100.0:
+                        if len(pts) >= 4 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < POLYLINE_CLOSE_TOL:
                             is_closed = True
                 else:
                     if e.is_closed:
                         is_closed = True
                     else:
                         pts = list(e.points())
-                        if len(pts) >= 4 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < 100.0:
+                        if len(pts) >= 4 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < POLYLINE_CLOSE_TOL:
                             is_closed = True
             except Exception:
                 continue
@@ -691,7 +718,7 @@ def detect_drawing_frames(doc: Any, index: GeometryIndex) -> list[dict[str, Any]
             w, h = b[2] - b[0], b[3] - b[1]
             if min(w, h) < FRAME_MIN_DIM:
                 continue
-            if not 1.05 <= (max(w, h) / max(min(w, h), 1e-6)) <= 2.4:
+            if not RECT_ASPECT_MIN <= (max(w, h) / max(min(w, h), 1e-6)) <= RECT_ASPECT_MAX:
                 continue
             polyline_cands.append({"bbox": b, "block": str(e.dxf.layer), "source": "polyline"})
 
@@ -737,7 +764,7 @@ def _guess_plot_scale(w: float, h: float) -> float:
         err = abs(s1 - s2) / max(mean, 1e-9)
         if best is None or err < best_err:
             best, best_err = mean, err
-    scale = max(float(best or 100.0), 1e-6)
+    scale = max(float(best or FALLBACK_TEXT_HEIGHT), 1e-6)
     long_mm = long_u / scale
     if long_mm < PAGE_LONG_MM_MIN:
         scale = long_u / PAGE_LONG_MM_MIN
@@ -748,7 +775,7 @@ def _guess_plot_scale(w: float, h: float) -> float:
 
 def _looks_like_box_caption(text: str) -> bool:
     t = (text or "").strip()
-    if not 3 <= len(t) <= 26 or not t.endswith(UNIT_CAPTION_SUFFIX):
+    if not UNIT_CAPTION_MIN_LEN <= len(t) <= UNIT_CAPTION_MAX_LEN or not t.endswith(UNIT_CAPTION_SUFFIX):
         return False
     head = t[:-3].strip()
     return bool(head) and head[0] not in "由详注如按本除并"
@@ -883,7 +910,7 @@ def _frame_title(texts: list[dict[str, Any]]) -> str:
         best, best_h = "", 0.0
         for t in pool:
             txt = t["text"].replace("\n", "").strip()
-            if not txt or len(txt) > 30:
+            if not txt or len(txt) > BOX_TITLE_MAX_LEN:
                 continue
             if any(p in txt for p in ("。", "；", "，", ";", ",")):
                 continue
@@ -927,8 +954,8 @@ def _unit_rects(index: GeometryIndex, frame_rect) -> list[tuple[float, float, fl
         w, h = b[2] - b[0], b[3] - b[1]
         if not (UNIT_RECT_MIN_W <= w <= UNIT_RECT_MAX_W and UNIT_RECT_MIN_H <= h <= UNIT_RECT_MAX_H):
             continue
-        if any(abs(b[0] - r[0]) < 200 and abs(b[1] - r[1]) < 200 and abs(b[2] - r[2]) < 200
-               and abs(b[3] - r[3]) < 200 for r in rects):
+        if any(abs(b[0] - r[0]) < UNIT_RECT_DEDUP_TOL and abs(b[1] - r[1]) < UNIT_RECT_DEDUP_TOL and abs(b[2] - r[2]) < UNIT_RECT_DEDUP_TOL
+               and abs(b[3] - r[3]) < UNIT_RECT_DEDUP_TOL for r in rects):
             continue
         rects.append(b)
     return rects
@@ -978,31 +1005,33 @@ def _cell_crop(rect, rects, frame, caption_y: float, pitch_x: float) -> tuple[fl
     w, h = x1 - x0, y1 - y0
 
     def v_overlap(r):
-        return min(r[3], y1) - max(r[1], y0) > 0.25 * min(h, r[3] - r[1])
+        return min(r[3], y1) - max(r[1], y0) > CROP_OVERLAP_RATIO * min(h, r[3] - r[1])
 
     def h_overlap(r):
-        return min(r[2], x1) - max(r[0], x0) > 0.25 * min(w, r[2] - r[0])
+        return min(r[2], x1) - max(r[0], x0) > CROP_OVERLAP_RATIO * min(w, r[2] - r[0])
 
     right_gaps = [r[0] - x1 for r in rects if r is not rect and v_overlap(r) and r[0] >= x1]
     top_gaps = [r[1] - y1 for r in rects if r is not rect and h_overlap(r) and r[1] >= y1]
     if right_gaps:
         right = x1 + min(right_gaps)
     else:
-        right = x0 + (pitch_x if pitch_x > w else w * 1.6)
-    right = min(right, x1 + w * 1.6, frame[2])
-    top = min(y1 + (min(top_gaps) / 2 if top_gaps else min(h * 0.25, 6000.0)), frame[3])
+        right = x0 + (pitch_x if pitch_x > w else w * CROP_WIDTH_FACTOR)
+    right = min(right, x1 + w * CROP_WIDTH_FACTOR, frame[2])
+    top = min(y1 + (min(top_gaps) / 2 if top_gaps
+                    else min(h * CROP_HEIGHT_RATIO, CROP_TOP_MAX_PAD)), frame[3])
 
     # 下邻箱框自适应安全裁切（同列且位于当前箱框下方）
     bottom_cands = [r for r in rects if r is not rect and h_overlap(r) and r[3] <= y0]
     if bottom_cands:
         below_top = max(r[3] for r in bottom_cands)
-        # 当前箱名下边界：箱名文字下方留白 250~350
-        cap_bot = min(caption_y - 250.0, y0 - 300.0) if caption_y < y0 else y0 - 800.0
-        # 严格取箱名下沿与下排箱顶的中位线，并至少高出下排箱顶 100，坚决不切入下排进线与表头
-        bottom = max(cap_bot, (cap_bot + below_top) / 2.0, below_top + 100.0)
+        # 当前箱名下边界：箱名文字下方留白
+        cap_bot = (min(caption_y - CROP_CAPTION_GAP, y0 - CROP_CAPTION_GAP_ALT)
+                   if caption_y < y0 else y0 - CROP_BOTTOM_GAP)
+        # 严格取箱名下沿与下排箱顶的中位线，并至少高出下排箱顶，坚决不切入下排进线与表头
+        bottom = max(cap_bot, (cap_bot + below_top) / 2.0, below_top + CROP_BELOW_PAD)
     else:
         if caption_y < y0:
-            bottom = min(y0 - 800.0, caption_y - 300.0)
+            bottom = min(y0 - CROP_BOTTOM_GAP, caption_y - CROP_CAPTION_GAP_ALT)
         else:
             bottom = y0 - CROP_PAD_BOTTOM
     bottom = max(frame[1], bottom)
@@ -1137,7 +1166,7 @@ def extract_cad_entities(dxf_path: str, doc: Any = None) -> list[dict[str, Any]]
             if not text:
                 continue
             insert = entity.dxf.insert
-            height = float(getattr(entity.dxf, "height", 10.0))
+            height = float(getattr(entity.dxf, "height", UNIT_CAPTION_DEFAULT_HEIGHT))
             rotation = float(getattr(entity.dxf, "rotation", 0.0))
             layer = sanitize_surrogates(str(getattr(entity.dxf, "layer", "0")))
             extracted.append({
@@ -1160,7 +1189,7 @@ def extract_cad_entities(dxf_path: str, doc: Any = None) -> list[dict[str, Any]]
             if not text:
                 continue
             insert = entity.dxf.insert
-            height = float(getattr(entity.dxf, "char_height", 10.0))
+            height = float(getattr(entity.dxf, "char_height", UNIT_CAPTION_DEFAULT_HEIGHT))
             rotation = float(getattr(entity.dxf, "rotation", 0.0))
             layer = sanitize_surrogates(str(getattr(entity.dxf, "layer", "0")))
             extracted.append({
@@ -1191,7 +1220,7 @@ def extract_cad_entities(dxf_path: str, doc: Any = None) -> list[dict[str, Any]]
                         "text": val,
                         "x": round(float(attrib.dxf.insert.x), 2),
                         "y": round(float(attrib.dxf.insert.y), 2),
-                        "height": round(float(getattr(attrib.dxf, "height", 10.0)), 2),
+                        "height": round(float(getattr(attrib.dxf, "height", UNIT_CAPTION_DEFAULT_HEIGHT)), 2),
                         "layer": layer,
                     })
         except Exception:
@@ -1250,9 +1279,9 @@ def render_svg_to_pdf(svg_path: str, out_pdf_path: str) -> bool:
 
 
 def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[str, Any]]]:
-    """主入口：将 DWG 或 DXF 转为标准 PDF 并提取全部原生文字流。
+    """主入口：尝试将 DWG 或 DXF 转为 PDF，并提取可识别的原生文字记录。
 
-    针对平铺多张图纸的 CAD 文件，自动探测所有电气系统图图框并进行多页矢量切片；
+    针对平铺多张图纸的 CAD 文件，尝试探测电气系统图图框并进行多页矢量切片；
     针对单张图纸 CAD，直接高质量渲染；
     具备持久化转换缓存，二次处理 0 耗时秒开。
     """

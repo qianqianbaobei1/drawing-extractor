@@ -8,7 +8,7 @@ import json
 import os
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE, "data")
+DATA_DIR = os.path.abspath(os.environ.get("EXTRACTOR_DATA_DIR") or os.path.join(BASE, "data"))
 
 PROJECTS_FILE = os.path.join(DATA_DIR, "projects.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
@@ -43,21 +43,44 @@ def _save(path: str, payload) -> None:
     os.replace(tmp, path)
 
 
+def _settings_file(tenant_id: str | None = None) -> str:
+    if not tenant_id:
+        try:
+            from db import get_current_tenant
+            t = get_current_tenant()
+            tenant_id = t[0] if isinstance(t, (tuple, list)) else str(t)
+        except Exception:
+            tenant_id = "default"
+    tenant_id = (tenant_id or "default").strip()
+    if tenant_id == "default":
+        return SETTINGS_FILE
+    safe_tid = "".join(c for c in tenant_id if c.isalnum() or c in ("-", "_"))
+    if not safe_tid:
+        safe_tid = "default"
+    return os.path.join(DATA_DIR, f"settings_{safe_tid}.json")
+
+
 # ---------- 设置 ----------
 
-def settings() -> dict:
-    return {**DEFAULT_SETTINGS, **_load(SETTINGS_FILE, {})}
+def settings(tenant_id: str | None = None) -> dict:
+    fpath = _settings_file(tenant_id)
+    file_data = _load(fpath, None)
+    if file_data is None and fpath != SETTINGS_FILE:
+        file_data = _load(SETTINGS_FILE, {})
+    return {**DEFAULT_SETTINGS, **(file_data or {})}
 
 
-def save_settings(patch: dict) -> dict:
-    merged = {**settings(), **{k: v for k, v in patch.items() if k in DEFAULT_SETTINGS}}
-    _save(SETTINGS_FILE, merged)
+def save_settings(patch: dict, tenant_id: str | None = None) -> dict:
+    fpath = _settings_file(tenant_id)
+    current = settings(tenant_id)
+    merged = {**current, **{k: v for k, v in patch.items() if k in DEFAULT_SETTINGS}}
+    _save(fpath, merged)
     return merged
 
 
-def public_settings() -> dict:
+def public_settings(tenant_id: str | None = None) -> dict:
     """出参：Key 只回传“是否已配置”，不泄露内容。"""
-    current = settings()
+    current = settings(tenant_id)
     key = current.get("vision_api_key") or os.environ.get("VISION_API_KEY", "")
     return {
         **{k: v for k, v in current.items() if k != "vision_api_key"},
@@ -66,9 +89,9 @@ def public_settings() -> dict:
     }
 
 
-def apply_settings_to_env() -> None:
+def apply_settings_to_env(tenant_id: str | None = None) -> None:
     """设置优先于 .env；只覆盖非空值，避免把 .env 里的 Key 抹掉。"""
-    current = settings()
+    current = settings(tenant_id)
     for key, env_name in (("vision_model", "VISION_MODEL"),
                           ("vision_base_url", "VISION_BASE_URL"),
                           ("vision_api_key", "VISION_API_KEY"),
@@ -86,7 +109,7 @@ def apply_settings_to_env() -> None:
 
 from db import (
     db_ensure_project, db_list_projects, db_record_ai_usage, db_get_ai_logs,
-    db_add_history, db_get_history
+    db_add_history, db_get_history, db_rename_project, db_update_project,
 )
 
 
@@ -98,6 +121,14 @@ def projects() -> list[dict]:
 
 def ensure_project(name: str) -> dict:
     return db_ensure_project(name)
+
+
+def update_project(name: str, patch: dict) -> dict | None:
+    return db_update_project(name, patch)
+
+
+def rename_project(old_name: str, new_name: str) -> dict:
+    return db_rename_project(old_name, new_name)
 
 
 def project_names() -> list[str]:

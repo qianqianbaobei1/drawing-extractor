@@ -20,12 +20,39 @@ from .schema import (
     RawExtraction,
     ReviewStatus,
     Uncertainty,
+    MODEL_EVIDENCE_ORIGIN,
 )
 from .normalizer import parse_breaker, parse_cable
+from .config import delivery, domain
 
-BASE_TITLE = "配电箱元器件清单(报价用)"
-AS_WRITTEN = "图纸写法无法安全拆分，按原文计入，数量待人工确认"
-NO_SPEC = "(规格未标注)"
+_DOMAIN = domain()
+_DELIVERY = delivery()
+_BREAKER_CFG = _DOMAIN["breaker"]
+_ESTIMATION = _DELIVERY["estimation"]
+DEFAULT_DEVICE_UNIT = _ESTIMATION["default_device_unit"]
+DEFAULT_ASSEMBLY_UNIT = _ESTIMATION["default_assembly_unit"]
+UNNAMED_DEVICE_FALLBACK = _ESTIMATION["unnamed_device_fallback"]
+UNNAMED_BOX_FALLBACK = _ESTIMATION["unnamed_box_fallback"]
+
+BASE_TITLE = _DELIVERY["labels"]["base_title"]
+AS_WRITTEN = _DELIVERY["labels"]["as_written"]
+NO_SPEC = _DELIVERY["labels"]["no_spec"]
+
+
+# 证据来源：assemble 只能把手上的模型自述登记为 model_vision 证据。
+# 只有 cad_native / ocr / human 才是独立于模型自述的物理事实证据（见 schema.PHYSICAL_EVIDENCE_ORIGINS），
+# 交叉验证由 corroborate.py 在拿到图纸原生文字后补齐。
+
+
+def _model_evidence(evidence_id: str, raw_content: str, bbox=None) -> Evidence:
+    """登记一条模型自述证据。标签统一带来源，避免被当成物理事实放行。"""
+    return Evidence(
+        evidence_id=evidence_id,
+        evidence_type=EvidenceType.TEXT.value,
+        raw_content=raw_content,
+        bbox=bbox,
+        origin=MODEL_EVIDENCE_ORIGIN,
+    )
 
 
 def _to_uncertainties(texts: list[str], model_texts: set[str]) -> list[Uncertainty]:
@@ -41,25 +68,49 @@ def _to_uncertainties(texts: list[str], model_texts: set[str]) -> list[Uncertain
         item.source = "model" if text in model_texts else "program"
         out.append(item)
     return out
-CATEGORY_ORDER = (
-    "配电箱体", "微型断路器", "剩余电流动作断路器", "塑壳断路器",
-    "双电源自动转换开关", "隔离开关", "断路器（其他）",
-    "交流接触器", "电流互感器", "热继电器", "电能表",
-    "浪涌保护器", "N排/PE排", "其他",
-)
-PREFIXES = (
-    ("MCB", "微型断路器"), ("RCB", "剩余电流动作断路器"),
-    ("MCCB", "塑壳断路器"), ("ATSE", "双电源自动转换开关"),
-    ("IS-", "隔离开关"), ("DS-", "隔离开关"),
-)
+CATEGORY_ORDER = tuple(_DOMAIN["categories"]["order"])
+PREFIXES = tuple((prefix, category) for prefix, category in _BREAKER_CFG["category_prefixes"])
+OTHER_CATEGORY = _BREAKER_CFG["other_category"]
 
 
 def _breaker_name(spec: str) -> str:
-    upper = spec.upper()
-    return next((name for prefix, name in PREFIXES if upper.startswith(prefix)), "断路器（其他）")
+    """按 config/domain.json 的 breaker 段把型号归到元器件类别。
+
+    判定顺序即规则顺序：先精确匹配标准代码前缀（MCB/MCCB/RCBO/ATSE/IS-/DS-），
+    再按规则表做前缀/包含判定，最后用脱扣曲线写法（C16/1P 等）按额定电流分流。
+    新增系列只改 JSON，不动代码。
+    """
+    s = (spec or "").strip()
+    upper = s.upper()
+    if not upper:
+        return OTHER_CATEGORY
+
+    # 1. 显式标准代码前缀（保留 MCB+Vigi 这类“主体+附件”结构的主体类别）
+    for prefix, name in PREFIXES:
+        if upper.startswith(prefix):
+            return name
+
+    # 2. 规则表：前缀优先，其次关键词包含
+    for rule in _BREAKER_CFG.get("category_rules", []):
+        category = rule.get("category") or OTHER_CATEGORY
+        if any(upper.startswith(k) for k in rule.get("prefix_any", [])):
+            return category
+        if any(k in upper for k in rule.get("contains_any", [])):
+            return category
+
+    # 3. 典型脱扣曲线与极数表示法：C16/1P, D32/3P, C63/2P, B10/1P 等
+    curve_regex = _BREAKER_CFG.get("curve_regex") or ""
+    m_curve = re.match(curve_regex, upper) if curve_regex else None
+    if m_curve:
+        amp = int(m_curve.group(1))
+        split = float(_BREAKER_CFG.get("curve_amp_split", 0))
+        return (_BREAKER_CFG["curve_le_category"] if amp <= split
+                else _BREAKER_CFG["curve_gt_category"])
+
+    return OTHER_CATEGORY
 
 
-ACCESSORY_PREFIXES = ("VM", "OF", "SD", "MX", "MN", "VIGI", "30MA", "MV")
+ACCESSORY_PREFIXES = tuple(_DOMAIN["accessory_prefixes"])
 
 
 def _parse_devices(value: str, allow_combo: bool = False) -> list[tuple[str, int]] | None:
@@ -270,17 +321,9 @@ def build_distribution_topology(boxes: list[Box], circuits: list[Circuit]) -> li
     return roots
 
 
-NON_BOX_PATTERNS = [
-    r"^PY-[0-9A-Z]+",   # 排烟风机出线负载电机
-    r"^BP-[0-9A-Z]+",   # 补风机出线负载电机
-    r"^XF-[0-9A-Z]+",   # 消防泵出线回路
-    r"^AKPM",           # 消防电源监控模块(二次设备，非箱柜)
-]
+NON_BOX_PATTERNS = list(_DOMAIN["cad"]["non_box_patterns"])
 
-GENERIC_BOX_TERMS = {
-    "控制箱", "排烟风机控制箱", "消防控制箱", "配电箱", "动力箱", "照明箱", "照明配电箱",
-    "动力配电箱", "空压机控制箱", "控制箱体", "二次控制箱", "就地控制箱",
-}
+GENERIC_BOX_TERMS = set(_DOMAIN["cad"]["generic_box_terms"])
 
 
 def _is_real_box_code(code: str) -> bool:
@@ -321,9 +364,11 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
         code = (box.code or "").strip()
         name = (box.name or "").strip()
         # 通用判断：若柜号或名称为二次监控仪表/模块，转入非回路设备清单
-        if any(k in name for k in ["监控模块", "传感模块", "测控装置", "电源监控"]) or code.upper().startswith("AKPM"):
+        if any(k in name for k in _DOMAIN["cad"]["secondary_device_markers"]) or code.upper().startswith("AKPM"):
             extra_devs_from_boxes.append(
-                ExtraDevice(name=name or "监控模块", spec=code, unit="只", quantity=1.0, used_in=box.location or "配电箱")
+                ExtraDevice(name=name or UNNAMED_DEVICE_FALLBACK, spec=code,
+                            unit=DEFAULT_DEVICE_UNIT, quantity=1.0,
+                            used_in=box.location or UNNAMED_BOX_FALLBACK)
             )
             continue
         if not _is_real_box(box):
@@ -357,12 +402,8 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
             if b.code:
                 ev_id = f"box.code.{b.code}"
                 if ev_id not in evidence_store:
-                    evidence_store[ev_id] = Evidence(
-                        evidence_id=ev_id,
-                        evidence_type=EvidenceType.TEXT.value,
-                        raw_content=b.code,
-                        bbox=getattr(b, "bbox", None),
-                    )
+                    evidence_store[ev_id] = _model_evidence(
+                        ev_id, b.code, getattr(b, "bbox", None))
                 b_code_ev_ids.append(ev_id)
 
             b.claims = {
@@ -370,7 +411,7 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
                     value=b.code,
                     raw_value=b.code,
                     value_evidence_ids=b_code_ev_ids,
-                    review_status=ReviewStatus.CONFIRMED.value if b_code_ev_ids else ReviewStatus.UNASSESSED.value
+                    review_status=ReviewStatus.PARSED_OK.value if b_code_ev_ids else ReviewStatus.UNASSESSED.value
                 ),
                 "box.location": GroundedField(
                     value=b.location,
@@ -380,7 +421,7 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
                 "box.ip_rating": GroundedField(
                     value=b.ip_rating,
                     raw_value=b.ip_rating,
-                    review_status=ReviewStatus.CONFIRMED.value if b.ip_rating else ReviewStatus.UNASSESSED.value
+                    review_status=ReviewStatus.PARSED_OK.value if b.ip_rating else ReviewStatus.UNASSESSED.value
                 )
             }
     boxes = {box.code: box for box in merged_boxes if box.code}
@@ -406,10 +447,13 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
         seen_circs.add(sig)
 
         # 结构化清洗断路器与导线参数 (Stage 5)
-        if not c_copy.structured_breaker:
+        # 若回路字段被修改过，强制更新结构化清洗参数
+        if not c_copy.structured_breaker or (c_copy.breaker and c_copy.structured_breaker.get("raw") != c_copy.breaker):
             c_copy.structured_breaker = parse_breaker(c_copy.breaker).model_dump()
-        if not c_copy.structured_cable:
+            c_copy.structured_breaker["raw"] = c_copy.breaker
+        if not c_copy.structured_cable or (c_copy.cable and c_copy.structured_cable.get("raw") != c_copy.cable):
             c_copy.structured_cable = parse_cable(c_copy.cable).model_dump()
+            c_copy.structured_cable["raw"] = c_copy.cable
 
         # 沉淀证据主张 Claim 字典与物理证据链 (Stage 6)
         if not c_copy.claims:
@@ -417,36 +461,21 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
             if c_copy.circuit_no:
                 ev_id = f"circuit.{c_copy.box}.{c_copy.circuit_no}.no"
                 if ev_id not in evidence_store:
-                    evidence_store[ev_id] = Evidence(
-                        evidence_id=ev_id,
-                        evidence_type=EvidenceType.TEXT.value,
-                        raw_content=c_copy.circuit_no,
-                        bbox=c_copy.bbox,
-                    )
+                    evidence_store[ev_id] = _model_evidence(ev_id, c_copy.circuit_no, c_copy.bbox)
                 c_no_ev_ids.append(ev_id)
 
             brk_ev_ids = []
             if c_copy.breaker:
                 ev_id = f"circuit.{c_copy.box}.{c_copy.circuit_no or 'none'}.breaker"
                 if ev_id not in evidence_store:
-                    evidence_store[ev_id] = Evidence(
-                        evidence_id=ev_id,
-                        evidence_type=EvidenceType.TEXT.value,
-                        raw_content=c_copy.breaker,
-                        bbox=c_copy.bbox,
-                    )
+                    evidence_store[ev_id] = _model_evidence(ev_id, c_copy.breaker, c_copy.bbox)
                 brk_ev_ids.append(ev_id)
 
             cable_ev_ids = []
             if c_copy.cable:
                 ev_id = f"circuit.{c_copy.box}.{c_copy.circuit_no or 'none'}.cable"
                 if ev_id not in evidence_store:
-                    evidence_store[ev_id] = Evidence(
-                        evidence_id=ev_id,
-                        evidence_type=EvidenceType.TEXT.value,
-                        raw_content=c_copy.cable,
-                        bbox=c_copy.bbox,
-                    )
+                    evidence_store[ev_id] = _model_evidence(ev_id, c_copy.cable, c_copy.bbox)
                 cable_ev_ids.append(ev_id)
 
             c_copy.claims = {
@@ -454,31 +483,61 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
                     value=c_copy.circuit_no,
                     raw_value=c_copy.circuit_no,
                     value_evidence_ids=c_no_ev_ids,
-                    review_status=ReviewStatus.CONFIRMED.value if c_no_ev_ids else ReviewStatus.UNASSESSED.value
+                    review_status=ReviewStatus.PARSED_OK.value if c_no_ev_ids else ReviewStatus.UNASSESSED.value
                 ),
                 "circuit.breaker": GroundedField(
                     value=c_copy.breaker,
                     raw_value=c_copy.breaker,
                     value_evidence_ids=brk_ev_ids,
-                    review_status=ReviewStatus.CONFIRMED.value if (brk_ev_ids and c_copy.structured_breaker and c_copy.structured_breaker.get("rated_current")) else ReviewStatus.UNASSESSED.value
+                    review_status=ReviewStatus.PARSED_OK.value if (brk_ev_ids and c_copy.structured_breaker and c_copy.structured_breaker.get("rated_current")) else ReviewStatus.UNASSESSED.value
                 ),
                 "circuit.cable": GroundedField(
                     value=c_copy.cable,
                     raw_value=c_copy.cable,
                     value_evidence_ids=cable_ev_ids,
-                    review_status=ReviewStatus.CONFIRMED.value if (cable_ev_ids and c_copy.structured_cable and c_copy.structured_cable.get("section_mm2")) else ReviewStatus.UNASSESSED.value
+                    review_status=ReviewStatus.PARSED_OK.value if (cable_ev_ids and c_copy.structured_cable and c_copy.structured_cable.get("section_mm2")) else ReviewStatus.UNASSESSED.value
                 ),
                 "circuit.phase": GroundedField(
                     value=c_copy.phase,
                     raw_value=c_copy.phase,
-                    review_status=ReviewStatus.CONFIRMED.value if c_copy.phase else ReviewStatus.UNASSESSED.value
+                    review_status=ReviewStatus.PARSED_OK.value if c_copy.phase else ReviewStatus.UNASSESSED.value
                 ),
                 "circuit.load_name": GroundedField(
                     value=c_copy.load_name,
                     raw_value=c_copy.load_name,
-                    review_status=ReviewStatus.CONFIRMED.value if c_copy.load_name else ReviewStatus.UNASSESSED.value
+                    review_status=ReviewStatus.PARSED_OK.value if c_copy.load_name else ReviewStatus.UNASSESSED.value
                 )
             }
+        else:
+            # 当回路已存在 Claims 时，比对并联动同步修改后的字段，坚决杜绝 Claim 残留旧值
+            fields_to_check = [
+                ("circuit.circuit_no", c_copy.circuit_no),
+                ("circuit.breaker", c_copy.breaker),
+                ("circuit.cable", c_copy.cable),
+                ("circuit.phase", c_copy.phase),
+                ("circuit.load_name", c_copy.load_name),
+            ]
+            for fname, curr_val in fields_to_check:
+                if fname in c_copy.claims:
+                    cf = c_copy.claims[fname]
+                    if cf.raw_value != curr_val:
+                        cf.value = curr_val
+                        cf.raw_value = curr_val
+                        cf.review_status = ReviewStatus.CONFIRMED.value
+                        cf.notes = "修改同步更新"
+                        # 补充修改追踪证据
+                        mod_ev_id = f"modified.{c_copy.box}.{fname}.{hash(curr_val) % 10000}"
+                        if mod_ev_id not in evidence_store:
+                            # 值被改动过：这条证据来自人工/工作台编辑，不是模型原始自述
+                            evidence_store[mod_ev_id] = Evidence(
+                                evidence_id=mod_ev_id,
+                                evidence_type=EvidenceType.TEXT.value,
+                                raw_content=curr_val,
+                                bbox=c_copy.bbox,
+                                origin="human",
+                            )
+                        if mod_ev_id not in cf.value_evidence_ids:
+                            cf.value_evidence_ids.append(mod_ev_id)
 
         dedup_circuits.append(c_copy)
 
@@ -501,7 +560,7 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
             row["notes"].append(note)
 
     for box in merged_boxes:
-        add("配电箱体", f"{box.code} {box.size}".strip(), "台", box.quantity,
+        add("配电箱体", f"{box.code} {box.size}".strip(), _ESTIMATION["default_box_unit"], box.quantity,
             box.code, "，".join(part for part in (box.ip_rating, box.install) if part))
 
     for circuit in circuits:
@@ -518,7 +577,7 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
                 # 宁可留一行“按原文计入、数量待确认”，也不能让这个器件从报价里消失：
                 # 漏一行是少算钱，留一行标记过的错数据只是要人工看一眼。
                 label = _breaker_name(value) if field == "breaker" else name
-                add(label, value.strip(), "只", box.quantity, place, AS_WRITTEN)
+                add(label, value.strip(), DEFAULT_DEVICE_UNIT, box.quantity, place, AS_WRITTEN)
                 warnings.append(
                     f"回路 {place}: {label} 的写法“{value}”无法安全拆分，"
                     f"已按图纸原文计入 1 只/台箱体，数量待人工确认"
@@ -526,7 +585,7 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
                 continue
             for spec, count in devices:
                 add(_breaker_name(spec) if field == "breaker" else name,
-                    spec, "只", count * box.quantity, place)
+                    spec, DEFAULT_DEVICE_UNIT, count * box.quantity, place)
 
     seen_devices = set()
     dedup_devices = []

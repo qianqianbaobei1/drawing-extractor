@@ -1,0 +1,42 @@
+{
+  "_comment": "视觉模型调用参数与解析门禁。",
+  "_env": {
+    "VISION_TIMEOUT_S": "transport.timeout_s",
+    "VISION_MAX_RETRIES": "transport.max_retries",
+    "VISION_TEMPERATURE": "generation.temperature",
+    "VISION_CONCURRENCY": "transport.concurrency",
+    "VISION_MAX_TOKENS": "generation.max_tokens"
+  },
+  "transport": {
+    "timeout_s": 300,
+    "max_retries": 3,
+    "retry_backoff_s": 2.0,
+    "max_workers": 4,
+    "max_image_bytes": 20971520,
+    "concurrency": 6
+  },
+  "generation": {
+    "temperature": 0,
+    "seed": null,
+    "detail": "high",
+    "force_json": true,
+    "max_tokens": 8192
+  },
+  "parse_gate": {
+    "required_sections": [
+      "boxes",
+      "circuits",
+      "extra_devices",
+      "requirements",
+      "uncertainties"
+    ],
+    "json_repair_attempts": 2,
+    "fail_on_missing_section": true,
+    "allow_partial_on_single_section_failure": true
+  },
+  "usage": {
+    "record_failed_calls": true,
+    "unknown_cost_value": null,
+    "unknown_cost_note": "该次调用未取得可计量的 usage，费用未知，不得记为 0"
+  }
+}

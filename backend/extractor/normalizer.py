@@ -38,24 +38,17 @@ class StructuredBreaker(BaseModel):
     leakage_ma: Optional[int] = Field(None, description="漏电动作电流 (mA), 如 30, 100, 300")
 
 
-# 常见电缆型号系列识别模式
-# 核心结构: [前缀阻燃耐火代号-]型号[铠装/软线代号]
-# 如: WDZ-BYJ, WDZN-BYJ, WDZA-YJV, WDZ-YJV22, ZR-YJV, NH-YJV, BV, BVR, YJV22
-CABLE_FAMILY_PATTERNS = [
-    re.compile(r"\b((?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?BYJ[A-Z]*)(?=[-_\s\d*(×x]|$)", re.IGNORECASE),
-    re.compile(r"\b((?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?(?:YJV|YJY)(?:22|23|32)?)(?=[-_\s\d*(×x]|$)", re.IGNORECASE),
-    re.compile(r"\b((?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?VV(?:22|23|32)?)(?=[-_\s\d*(×x]|$)", re.IGNORECASE),
-    re.compile(r"\b((?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?BVR)(?=[-_\s\d*(×x]|$)", re.IGNORECASE),
-    re.compile(r"\b((?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?BV)(?=[-_\s\d*(×x]|$)", re.IGNORECASE),
-    re.compile(r"\b((?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?RVVP?)(?=[-_\s\d*(×x]|$)", re.IGNORECASE),
-]
+# 电缆型号系列与敷设方式词法来自 config/domain.json 的 cable 段，新增系列只改配置。
+from .config import domain as _domain
 
-# 常见穿管敷设方式识别模式 (如 -SC20-CC, /MR/CT, WC/FC)
-LAYING_METHOD_PATTERN = re.compile(
-    r"(?:-|/|\s|^)((?:SC|PC|KBG|JDG|CT|MR|PR|CP|RC|PVC)\d{0,3}"
-    r"(?:[/-](?:CC|WC|FC|WS|CE|ACC|SR|MR|CT|WE))*)\b",
-    re.IGNORECASE
-)
+_CABLE_VOCAB = _domain()["cable"]
+
+CABLE_FAMILY_PATTERNS = [re.compile(pattern, re.IGNORECASE)
+                         for pattern in _CABLE_VOCAB["family_patterns"]]
+
+LAYING_METHOD_PATTERN = re.compile(_CABLE_VOCAB["laying_method_regex"], re.IGNORECASE)
+
+DEFAULT_LAYING = _CABLE_VOCAB["default_laying"]
 
 
 def parse_cable(raw: str) -> StructuredCable:

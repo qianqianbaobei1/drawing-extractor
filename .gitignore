@@ -29,6 +29,8 @@ htmlcov/
 backend/work/
 backend/data/*.db*
 backend/data/*.json
+# 价格库原始数据（5.7MB，与 .db 同源，属于本地数据不进仓库）
+backend/data/*.csv
 *.dwg
 *.dxf
 *.log

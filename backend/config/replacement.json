@@ -1,0 +1,60 @@
+{
+  "_comment": "国产化平替选型规则。品牌→系列对照表与提示文案都在这里，新增品牌只改配置。",
+  "_env": {},
+  "series": {
+    "正泰": {
+      "rcbo_std": "NXBLE-63",
+      "rcbo_high": "NXBLE-63H",
+      "mcb_std": "NXB-63",
+      "mcb_high": "NXB-63H",
+      "mccb": "NM8N-{frame}S",
+      "mccb_family": "NM8N系列",
+      "acb": "NXA",
+      "spd": "NU6-II",
+      "contactor": "NC1",
+      "ats": "NZ7"
+    },
+    "良信": {
+      "rcbo_std": "NDB1LE-63",
+      "rcbo_high": "NDB1LE-63",
+      "mcb_std": "NDB1-63",
+      "mcb_high": "NDB2-63",
+      "mccb": "NDM1-{frame}S",
+      "mccb_family": "NDM1系列",
+      "acb": "NDW1",
+      "spd": "NDY1",
+      "contactor": "NDC1",
+      "ats": "NDQ1"
+    },
+    "德力西": {
+      "rcbo_std": "CDB6LE-63",
+      "rcbo_high": "CDB6LE-63",
+      "mcb_std": "CDB6i-63",
+      "mcb_high": "CDB6H-63",
+      "mccb": "CDM3-{frame}S",
+      "mccb_family": "CDM3系列",
+      "acb": "CDW3",
+      "spd": "CDY1",
+      "contactor": "CJX2s",
+      "ats": "CDQ3"
+    }
+  },
+  "fallback_brand": "德力西",
+  "leakage_default_ma": 30,
+  "ka_notes": {
+    "high": "10kA 高分断",
+    "standard": "6kA 标准分断（近变压器端建议复核短路电流）"
+  },
+  "note_templates": {
+    "await_amp": "原图纸未标注额定电流，推荐选用{target_brand} {series}系列，需核对负荷计算书定型",
+    "generic": "物理规格与安装尺寸与原图深化要求完全兼容"
+  },
+  "comparison": {
+    "unknown_family_category": "OTHER",
+    "families": {
+      "微型": "MCB",
+      "漏电": "MCB",
+      "塑壳": "MCCB"
+    }
+  }
+}

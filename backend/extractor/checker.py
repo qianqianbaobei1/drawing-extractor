@@ -17,10 +17,15 @@ from typing import Any, List, Optional
 from pydantic import BaseModel, Field
 
 from .assemble import PREFIXES, _parse_devices, is_incoming_circuit
+from .config import domain as _domain
+
+_CHECKS = _domain()["checks"]
 from .schema import (
     ExtractionResult,
     EvidenceType,
     FIELD_EVIDENCE_POLICY,
+    PHYSICAL_EVIDENCE_ORIGINS,
+    ReviewStatus,
     validate_field_evidence,
 )
 
@@ -124,20 +129,9 @@ def _is_valid_phase(phase: str) -> bool:
     if not phase:
         return True
     p = re.sub(r"[\s,./~_、\-]+", "", phase).upper()
-    valid_patterns = {
-        "L1", "L2", "L3", "L1NPE", "L2NPE", "L3NPE",
-        "L123", "L1L2L3", "L1L2L3PE", "L1L2L3NPE", "L13NPE", "L13PE",
-        "L1L3NPE", "L1L3PE", "3P", "1P", "2P", "4P", "三相", "单相", "A", "B", "C", "ABC",
-    }
-    if p in valid_patterns:
+    if p in set(_CHECKS["phase_valid_tokens"]):
         return True
-    if re.match(r"^L[123](N)?(PE)?$", p):
-        return True
-    if re.match(r"^L1[~-]?L?3(N)?(PE)?$", p):
-        return True
-    if re.match(r"^L[1-3]{1,3}(N)?(PE)?$", p):
-        return True
-    return False
+    return any(re.match(pattern, p) for pattern in _CHECKS["phase_valid_regexes"])
 
 
 def check_result_issues(result: ExtractionResult) -> list[CheckIssue]:
@@ -182,7 +176,7 @@ def check_result_issues(result: ExtractionResult) -> list[CheckIssue]:
                 target=f"第 {index} 项元器件",
                 detail=f"第 {index} 项元器件 {component.name or component.spec or '(未命名)'} 数量无效，请核对"
             ))
-        if component.unit and component.unit not in {"只", "台", "套", "米", "块", "个", "组"}:
+        if component.unit and component.unit not in set(_CHECKS["allowed_units"]):
             issues.append(CheckIssue(
                 rule_code="COMPONENT_UNIT_SUSPECT",
                 severity=CheckSeverity.WARNING.value,
@@ -250,7 +244,7 @@ def check_result_issues(result: ExtractionResult) -> list[CheckIssue]:
                 elif p == "L3":
                     phase_loads["L3"] += val
                     has_loads = True
-                elif p in ("L123", "3P", "3PH", "L1,L2,L3"):
+                elif p in set(_CHECKS["three_phase_markers"]):
                     phase_loads["L1"] += val / 3.0
                     phase_loads["L2"] += val / 3.0
                     phase_loads["L3"] += val / 3.0
@@ -261,9 +255,10 @@ def check_result_issues(result: ExtractionResult) -> list[CheckIssue]:
         if has_loads:
             p_vals = [phase_loads["L1"], phase_loads["L2"], phase_loads["L3"]]
             p_max, p_min = max(p_vals), min(p_vals)
-            if p_max > 1.0 and (phase_loads["L1"] > 0 and phase_loads["L2"] > 0 and phase_loads["L3"] > 0):
+            if p_max > float(_CHECKS["phase_unbalance_min_total_kw"]) and (
+                    phase_loads["L1"] > 0 and phase_loads["L2"] > 0 and phase_loads["L3"] > 0):
                 unbalance = ((p_max - p_min) / p_max) * 100.0
-                if unbalance > 15.0:
+                if unbalance > float(_CHECKS["phase_unbalance_warn_pct"]):
                     box_prefix = f"（{box_name}）" if box_name != "未指定箱体" else ""
                     issues.append(CheckIssue(
                         rule_code="PHASE_UNBALANCE",
@@ -306,7 +301,6 @@ def check_result_issues(result: ExtractionResult) -> list[CheckIssue]:
     # 7. 字段级证据政策校验（防编造：安装位置、断路器、电缆型号绝对禁止纯 MODEL_INFERENCE）
     if result.evidence_store:
         for ev_id, ev in result.evidence_store.items():
-            # 校验关联字段
             for field_path, allowed in FIELD_EVIDENCE_POLICY.items():
                 if field_path in ev_id and ev.evidence_type not in allowed:
                     issues.append(CheckIssue(
@@ -318,6 +312,30 @@ def check_result_issues(result: ExtractionResult) -> list[CheckIssue]:
                             f"'{ev.evidence_type}' 证据，违反证据政策，严禁无据臆测！"
                         )
                     ))
+
+    # 7b. 状态一致性：标为“已确认”却拿不出任何独立于模型自述的证据，是真矛盾。
+    # 注意不能因为“只有模型自述”就每次报警：图片型 PDF 本来就没第二个来源，
+    # 那属于“未交叉验证”，由 corroborate 汇总成一条说明，不在这里刷屏。
+    for item in list(result.boxes or []) + list(result.circuits or []):
+        for field_path, claim in (getattr(item, "claims", None) or {}).items():
+            if claim.review_status != ReviewStatus.CONFIRMED.value:
+                continue
+            origins = {
+                result.evidence_store[ev_id].origin
+                for ev_id in claim.value_evidence_ids
+                if ev_id in result.evidence_store
+            }
+            if not (origins & PHYSICAL_EVIDENCE_ORIGINS):
+                issues.append(CheckIssue(
+                    rule_code="EVIDENCE_STATUS_MISMATCH",
+                    severity=CheckSeverity.WARNING.value,
+                    target=field_path,
+                    detail=(
+                        f"【证据状态不符】字段 '{field_path}' 被标为已确认，"
+                        f"但支撑证据来源只有 {sorted(origins) or ['无']}，"
+                        f"缺少独立于模型自述的物理证据"
+                    )
+                ))
 
     # 8. 图纸目录对账审计结果自动注入
     if result.reconciliation and result.reconciliation.has_catalog:

@@ -1,4 +1,5 @@
 import unittest
+import test_support  # noqa: F401
 from fastapi.testclient import TestClient
 from app import app
 from db import init_db
@@ -67,7 +68,17 @@ class TestAuthAndCleanup(unittest.TestCase):
         self.assertFalse(me_res_after.json()["authenticated"])
 
     def test_system_clean_test_data(self):
-        res = self.client.post("/api/system/clean_test_data")
+        # 1. 匿名未认证调用应被 403 严格拒绝
+        unauth_res = self.client.post("/api/system/clean_test_data")
+        self.assertEqual(unauth_res.status_code, 403)
+        self.assertIn("权限不足", unauth_res.json()["detail"])
+
+        # 2. 以系统管理员身份登录并携带 Token，成功清空测试数据
+        login_res = self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        self.assertEqual(login_res.status_code, 200)
+        token = login_res.json()["token"]
+
+        res = self.client.post("/api/system/clean_test_data", headers={"Authorization": f"Bearer {token}"})
         self.assertEqual(res.status_code, 200)
         data = res.json()
         self.assertTrue(data.get("ok"))
@@ -122,11 +133,15 @@ class TestAuthAndCleanup(unittest.TestCase):
 
     def test_api_key_public_settings_mask(self):
         import store
-        store.save_settings({"vision_api_key": "sk-1234567890abcdef"})
-        pub = store.public_settings()
-        self.assertTrue(pub["vision_api_key_set"])
-        self.assertEqual(pub["vision_api_key_hint"], "***")
-        self.assertNotIn("cdef", pub["vision_api_key_hint"])
+        orig = store.settings().get("vision_api_key", "")
+        try:
+            store.save_settings({"vision_api_key": "sk-1234567890abcdef"})
+            pub = store.public_settings()
+            self.assertTrue(pub["vision_api_key_set"])
+            self.assertEqual(pub["vision_api_key_hint"], "***")
+            self.assertNotIn("cdef", pub["vision_api_key_hint"])
+        finally:
+            store.save_settings({"vision_api_key": orig})
 
 
 if __name__ == "__main__":

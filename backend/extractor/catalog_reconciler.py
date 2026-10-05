@@ -18,8 +18,10 @@ from .schema import (
     normalize_code,
 )
 
-# 常见低压配电箱/柜代号前缀
-PANEL_PREFIX_PATTERN = r"(?:AL|AP|AT|AW|AA|AH|AM|APE|ALE|ATE|AWE|JX|KZ|XF|P|GGD|GCK|MNS|XL|AC|AK)"
+# 常见低压配电箱/柜代号前缀来自 config/domain.json 的 catalog 段
+from .config import domain as _domain
+
+PANEL_PREFIX_PATTERN = _domain()["catalog"]["panel_prefix_pattern"]
 
 
 def expand_panel_range(text: str) -> list[str]:

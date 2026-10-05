@@ -13,6 +13,7 @@ import os
 import tempfile
 import unittest
 import uuid
+import test_support  # noqa: F401
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -45,18 +46,49 @@ class ExportGateTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(fastapi_app)
 
-    def test_excel_409_默认拦截(self):
+    def test_excel_未确认存疑默认可直接导出(self):
+        """导出是交付动作：默认不被存疑项遮挡，未确认项随 Excel 的待核对区一起交出。"""
         tid = _mk_job([{"location": "WL1", "detail": "电缆敷设方式不明", "resolved": False}])
         r = self.client.get(f"/api/jobs/{tid}/excel")
-        self.assertEqual(r.status_code, 409)
-        body = r.json()["detail"]
-        self.assertEqual(body["unresolved_count"], 1)
-        self.assertEqual(body["unresolved"][0]["location"], "WL1")
+        self.assertEqual(r.status_code, 200)
+
+    def test_excel_门禁显式打开时才拦(self):
+        """门禁机制保留：把 export_gate.block_unresolved_default 打开就恢复拦截，force 可单次放行。"""
+        import app as app_module
+        from extractor.config import load
+        original = app_module._DELIVERY
+        try:
+            app_module._DELIVERY = {**original,
+                                    "export_gate": {**original.get("export_gate", {}),
+                                                    "block_unresolved_default": True}}
+            tid = _mk_job([{"location": "WL1", "detail": "电缆敷设方式不明", "resolved": False}])
+            r = self.client.get(f"/api/jobs/{tid}/excel")
+            self.assertEqual(r.status_code, 409)
+            self.assertEqual(r.json()["detail"]["unresolved_count"], 1)
+            # 显式担责放行
+            self.assertEqual(self.client.get(f"/api/jobs/{tid}/excel?force=true").status_code, 200)
+        finally:
+            app_module._DELIVERY = original
+        self.assertFalse(load("delivery")["export_gate"]["block_unresolved_default"])
 
     def test_excel_无存疑正常导出(self):
         tid = _mk_job([{"location": "WL1", "detail": "电缆敷设方式不明", "resolved": True}])
         r = self.client.get(f"/api/jobs/{tid}/excel")
         self.assertEqual(r.status_code, 200)
+
+    def test_未确认存疑会写进Excel而不拦下载(self):
+        """产品口径：导出不被遮挡，但未确认项必须如实随文件交出，不能悄悄丢。"""
+        import io
+        import openpyxl
+        tid = _mk_job([{"location": "2SAL2", "detail": "RCBO 数量截断未能确认", "resolved": False}],
+                      circuits=[{"box": "1AL1", "circuit_no": "WL1", "breaker": "C16/1P"}])
+        r = self.client.get(f"/api/jobs/{tid}/excel")
+        self.assertEqual(r.status_code, 200)
+        wb = openpyxl.load_workbook(io.BytesIO(r.content))
+        text = "\n".join(str(v) for ws in wb.worksheets for row in ws.iter_rows(values_only=True)
+                         for v in row if v)
+        self.assertIn("RCBO 数量截断未能确认", text)
+        self.assertIn("2SAL2", text)
 
     def test_job_id_非法字符_400(self):
         for bad in ["..", "a/b", "a b", "a$b", "", "x" * 65]:
@@ -286,5 +318,4 @@ class SecurityHardeningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 

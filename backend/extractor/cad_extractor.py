@@ -1,55 +1,96 @@
 # -*- coding: utf-8 -*-
-"""CAD (DXF/DWG) 原生矢量电气系统图高精度表格提取器。
+"""CAD (DXF/DWG) 原生几何解析器。
 
-直接从 AutoCAD 数据库读取 100% 精确的矢量文字与几何坐标：
-1. 识别全部真实配电箱柜标头与包围盒（消除漏拆与虚构柜号）；
-2. 空间各向异性拓扑聚类分块（消除一图多卡与回路串箱重复）；
-3. 严格按物理列坐标与电气语义提取回路属性（消除断路器留空、字段串行、格式乱码）。
+从可读取的 CAD 文字与几何实体生成箱体和回路候选。实体内容、块结构、比例、图层与
+布局空间可能不完整或无法解释；输出不等同于完整图纸事实，必须经过独立证据、覆盖
+与人工核验，不能承诺 100% 准确或零遗漏。
 """
 
 from collections import defaultdict
 import math
+import os
 import re
 from typing import Any
 
-from .cad import clean_mtext, load_dxf_document
+from .cad import clean_mtext, dwg_to_dxf, load_dxf_document
 from .schema import Box, Circuit, ExtraDevice, RawExtraction, Requirement, Uncertainty
 
-RE_CIRCUIT_NO = re.compile(
-    r"^(N\d+|WL\d+|WP\d+|E\d+|WX\d+|[A-Z0-9]+-[0-9A-Z]+-[PC]\d+|[A-Z0-9]+-[PC]\d+|PY-\d+[A-Z]?-[PC]\d+|BF-\d+[A-Z]?-[PC]\d+)$",
-    re.I,
-)
-RE_PHASE = re.compile(r"^(L[123NPE~,\.\-\s/]+|380/220V|220V|380V)$", re.I)
-RE_POWER = re.compile(r"^(\d+(\.\d+)?\s*kW(\s*x\s*\d+)?|Pe\s*=\s*\d+(\.\d+)?\s*kW)$", re.I)
-RE_CURRENT = re.compile(r"^(\d+(\.\d+)?\s*A|\d+~\d+A)$", re.I)
-RE_CABLE = re.compile(
-    r"^(ZR|NH|WDZ|WDZN|ZA|ZB|ZC)?[\-\s]*(YJV|BV|BVR|RVV|KVV|BBTRZ)[\-\s\d/]+.*",
-    re.I,
-)
-RE_BREAKER = re.compile(
-    r"^(内配\s*)?(MCB|MCCB|RCBO|GL\-|ATS|ATSE|SPD|IS\-|DS\-|DZ\d+|C65|NSX|EZD|iC65|NM\d+|CM\d+|TM\d+)",
-    re.I,
-)
-RE_BREAKER_FALLBACK = re.compile(
-    r"(RCBO/[1234]P|MCB-[A-Z0-9/]+|MCCB-[A-Z0-9/]+|\b[CD]\d+A?/[1234]P|\b\d+A/[1234]P)",
-    re.I,
-)
+from .config import domain as _domain, pipeline as _pipeline
 
-PANEL_CODE_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9\-])(?:消防)?("
-    r"01[A-Za-z][A-Za-z0-9\-]+"
-    # 通用柜号形态：字母数字混排且至少含一位数字（如 2SAL2/2ALE/2AT/2SAL3/AW1）。
-    # 纯字母的器件词（MCB/SPD/MCCB/RCBO/ATSE）不含数字，不会被误判为柜号。
-    # 两处排除：数字+字母形排除常见单位（6kA/220V/63A）；
-    # 字母+数字形排除常见规格前缀（IP65/DZ47/SC25/NM1）。
-    r"|\d+(?!(?i:kA|kW|VA|V|A|W|Hz)\b)[A-Za-z]{2,6}\d*"
-    r"|(?!(?i:IP|DZ|SC|MC|BV|YJV|NM|PE|PC)\d)[A-Za-z]{2,6}\d+"
-    r")(?![A-Za-z0-9])"
-)
+_B = _domain()["breaker"]
+_CAD_CONFIG = _pipeline()["cad"]
+_V = _domain()["vocabulary"]
+_D = _domain()["cad"]
 
-GENERIC_DISCARD_TERMS = {
-    "控制箱", "配电箱", "动力箱", "照明箱", "照明配电箱", "动力配电箱", "排烟风机控制箱",
-}
+RE_CIRCUIT_NO = re.compile(_V["circuit_no_regex"], re.I)
+RE_PHASE = re.compile(_V["phase_regex"], re.I)
+RE_POWER = re.compile(_V["power_regex"], re.I)
+RE_CURRENT = re.compile(_V["current_regex"], re.I)
+RE_CABLE = re.compile(_V["cable_regex"], re.I)
+
+BREAKER_PREFIXES = _B["model_prefixes"]
+RE_BREAKER = re.compile(_B["model_regex_template"].format(prefixes=BREAKER_PREFIXES), re.I)
+RE_BREAKER_FALLBACK = re.compile(_B["fallback_regex"], re.I)
+RE_DISALLOWED_PREFIXES = re.compile(_B["disallowed_prefixes_regex"], re.I)
+
+RE_ENGINEERING_UNIT = re.compile(_V["engineering_unit_regex"], re.I)
+RE_NATIONAL_ATLAS = re.compile(_V["national_atlas_regex"], re.I)
+CIRCUIT_NO_MAX_DIGITS = int(_V["circuit_no_max_digits"])
+
+# 电压/频率/功率这类工程量单独成文时不是箱号，按配置正则排除（可按项目补规则，不改代码）
+NON_PANEL_TOKEN_RES = [re.compile(pattern, re.I) for pattern in _V.get("non_panel_token_regexes", [])]
+
+
+def extract_panel_code(text: str) -> str | None:
+    """通用电气配电箱/柜体编号提取器（无项目/图纸特定硬编码）。
+
+    依据行业通用词法结构：[可选功能/楼层前缀]+[类别字母]+[数字编号]+[可选子代号]。
+    严格根据工程通用规则排除：纯工程量单位、电线电缆代号、穿管敷设代号、断路器器件前缀、国标图集编号、长数字工程编号。
+    """
+    clean = re.split(r"[:：]", text, maxsplit=1)[0].strip()
+    clean = re.sub(r"^消防", "", clean).strip()
+
+    for m in re.finditer(r"(?<![A-Za-z0-9\-])([A-Za-z0-9]+(?:[\-/][A-Za-z0-9]+)*)(?![A-Za-z0-9])", clean):
+        token = m.group(1).strip()
+        # 必须同时包含字母与数字
+        if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token)):
+            continue
+        # 排除连续 4 位及以上数字（年份/图号/工程编号）
+        if re.search(rf"\d{{{CIRCUIT_NO_MAX_DIGITS},}}", token):
+            continue
+        # 排除国标图集代号（如 03D702-3, 07SD101-8）
+        if RE_NATIONAL_ATLAS.match(token):
+            continue
+        # 排除纯工程量单位（如 63A, 10kW, 220V, 50Hz, 600mm）
+        if RE_ENGINEERING_UNIT.match(token):
+            continue
+        # 排除电缆、管材、标准、断路器器件型号前缀
+        if RE_DISALLOWED_PREFIXES.match(token):
+            continue
+        # 排除电压/频率/功率等工程量写法（如 380/220V、DC36V、50Hz）
+        if any(pat.match(token) for pat in NON_PANEL_TOKEN_RES):
+            continue
+        return token.upper()
+    return None
+
+
+class _PanelCodeMatcher:
+    """包装 extract_panel_code 以保持与既有 re.search 接口的完全兼容。"""
+    def search(self, text: str):
+        code = extract_panel_code(text)
+        if code:
+            class _Match:
+                def __init__(self, c):
+                    self._c = c
+                def group(self, n=1):
+                    return self._c
+            return _Match(code)
+        return None
+
+
+PANEL_CODE_PATTERN = _PanelCodeMatcher()
+
+GENERIC_DISCARD_TERMS = set(_D["generic_discard_terms"])
 
 
 def _extract_box_metadata(header_text: str, nearby_texts: list[tuple]) -> dict[str, Any]:
@@ -120,15 +161,24 @@ def _extract_box_metadata(header_text: str, nearby_texts: list[tuple]) -> dict[s
 
 
 def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
-    """从 CAD 数据库直接提取全部真实箱体与回路。"""
+    """从 CAD 数据库提取箱体与回路候选；返回结果仍需和图面、目录进行对账。"""
     if isinstance(dxf_or_doc, str):
+        if dxf_or_doc.lower().endswith(".dwg"):
+            work_dir = os.path.dirname(dxf_or_doc)
+            base_name = os.path.splitext(os.path.basename(dxf_or_doc))[0]
+            cache_dir = os.path.join(work_dir, ".cad_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            cached_dxf = os.path.join(cache_dir, f"{base_name}.dxf")
+            if not os.path.exists(cached_dxf) or os.path.getsize(cached_dxf) == 0:
+                dwg_to_dxf(dxf_or_doc, cached_dxf)
+            dxf_or_doc = cached_dxf
         doc = load_dxf_document(dxf_or_doc)
     else:
         doc = dxf_or_doc
 
     msp = doc.modelspace()
 
-    # 1. 抓取模型空间中有效文字（过滤建筑底图坐标区域与顶部说明区，保留电气系统图区 150000 <= y <= 300000）
+    # 1. 抓取当前模型空间中可识别的文字实体；空间窗口按本图字高估算，不保证适用于任意布局。
     all_texts = []
     for e in list(msp.query("TEXT")) + list(msp.query("MTEXT")):
         try:
@@ -152,7 +202,17 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
             uncertainties=[Uncertainty.from_text("CAD模型空间未检出任何有效文字实体")],
         )
 
-    # 2. 检测所有配电箱标头
+    # 2. 自适应物理尺度推导 (Adaptive Scale Estimation)
+    # 基于全图有效文字高度中位数自适应推导图纸比例尺，彻底杜绝 1:1 或 1:100 绘图时的尺度敏感问题
+    import statistics
+    valid_heights = [h for _, _, _, h in all_texts if h > 0]
+    med_h = (float(statistics.median(valid_heights)) if valid_heights
+             else float(_CAD_CONFIG["circuit_scale_basis_height"]))
+    base_h = max(med_h, 1.0)
+    scale_factor = base_h / float(_CAD_CONFIG["circuit_scale_basis_height"])
+    header_h_threshold = base_h * 1.15
+
+    # 检测所有配电箱标头
     candidates = []
     for t, x, y, h in all_texts:
         # 排除回路出线引用、规范、图纸编号与干线附注。
@@ -166,10 +226,10 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
             code = m.group(1).upper()
             if code in GENERIC_DISCARD_TERMS:
                 continue
-            # 判断是否为箱体标头
+            # 判断是否为箱体标头（关键词或字高自适应大于中位数 15%）
             is_header = (
                 any(k in t for k in ["箱", "柜", "盘", "系统图", "共1台", "（壁挂式）", "（嵌墙安装）"])
-                or h >= 280
+                or h >= header_h_threshold
             )
             if is_header:
                 candidates.append((code, t, x, y, h))
@@ -184,7 +244,7 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
         best = max(
             group,
             key=lambda item: (100 if any(k in item[1] for k in ["配电箱", "系统图", "控制箱", "总箱", "电源箱"]) else 0)
-            + (10 if item[4] >= 300 else 0)
+            + (10 if item[4] >= base_h * 1.2 else 0)
             + len(item[1]),
         )
         best_headers[code] = (best[1], best[2], best[3], best[4])
@@ -195,7 +255,31 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
         if RE_CIRCUIT_NO.match(t):
             all_circuit_anchors.append((t, x, y))
 
+    # 自适应推导表格回路行高容差 (Row Y Tolerance)
+    # 分析回路锚点真实间距直方图；若无密集回路，则按 1.83 倍字高自适应推导
+    line_spacing = None
+    if len(all_circuit_anchors) >= 2:
+        sorted_anchors = sorted(all_circuit_anchors, key=lambda a: (round(a[1] / max(base_h * 10, 1.0)), -a[2]))
+        y_diffs = []
+        for i in range(len(sorted_anchors) - 1):
+            a1, a2 = sorted_anchors[i], sorted_anchors[i+1]
+            if abs(a1[1] - a2[1]) <= base_h * 6:
+                diff = abs(a1[2] - a2[2])
+                if base_h * 1.2 <= diff <= base_h * 15:
+                    y_diffs.append(diff)
+        if y_diffs:
+            line_spacing = statistics.median(y_diffs)
+
+    if line_spacing and line_spacing > base_h:
+        row_y_tolerance = line_spacing * 0.45
+    else:
+        row_y_tolerance = base_h * float(_CAD_CONFIG["circuit_row_tolerance_ratio"])
+
     # 4. 空间各向异性拓扑关联：将回路锚点归属于所属配电箱
+    # 自适应物理跨度阈值
+    max_dx = float(_CAD_CONFIG["circuit_box_max_dx"]) * scale_factor
+    max_dy = float(_CAD_CONFIG["circuit_box_max_dy"]) * scale_factor
+
     assigned_circuits: dict[str, list[tuple[str, float, float]]] = {code: [] for code in best_headers}
     for cno, cx, cy in all_circuit_anchors:
         best_dist = float("inf")
@@ -203,8 +287,7 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
         for code, (title, hx, hy, h) in best_headers.items():
             dx = cx - hx
             dy = cy - hy
-            # 同一箱体水平范围通常在 35,000 以内，垂直范围在 45,000 以内
-            if abs(dx) > 35000 or abs(dy) > 45000:
+            if abs(dx) > max_dx or abs(dy) > max_dy:
                 continue
             # 各向异性权重：横向跨列的距离惩罚是纵向的 2.5 倍，确保回路不会跳到相邻箱体列
             dist = (dx * 2.5) ** 2 + dy ** 2
@@ -221,6 +304,18 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
     extracted_reqs: list[Requirement] = []
     extracted_uncertainties: list[Uncertainty] = []
 
+    # 自适应包围盒外扩距离（确保覆盖多列系统图表格横向跨度，通常跨越 50~80 倍字高）
+    pad_x = max(float(_CAD_CONFIG["circuit_pad_x"]) * scale_factor,
+                base_h * float(_CAD_CONFIG["circuit_pad_x_height_ratio"]))
+    pad_y = max(float(_CAD_CONFIG["circuit_pad_y"]) * scale_factor,
+                base_h * float(_CAD_CONFIG["circuit_pad_y_height_ratio"]))
+    def_win_x = max(float(_CAD_CONFIG["circuit_def_window_x"]) * scale_factor,
+                    base_h * float(_CAD_CONFIG["circuit_def_window_x_height_ratio"]))
+    def_win_y_down = max(float(_CAD_CONFIG["circuit_def_window_y_down"]) * scale_factor,
+                         base_h * float(_CAD_CONFIG["circuit_def_window_y_down_height_ratio"]))
+    def_win_y_up = max(float(_CAD_CONFIG["circuit_def_window_y_up"]) * scale_factor,
+                       base_h * float(_CAD_CONFIG["circuit_def_window_y_up_height_ratio"]))
+
     for code in sorted(best_headers.keys()):
         title, hx, hy, hh = best_headers[code]
         c_anchors = assigned_circuits[code]
@@ -229,15 +324,15 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
         if not c_anchors and not any(k in title for k in ["配电箱", "总箱", "控制箱", "电源箱"]):
             continue
 
-        # 确定箱体局部文字探测包围盒
+        # 确定箱体局部文字探测包围盒（自适应尺度）
         if c_anchors:
             xs = [c[1] for c in c_anchors] + [hx]
             ys = [c[2] for c in c_anchors] + [hy]
-            bx0, bx1 = min(xs) - 8000, max(xs) + 8000
-            by0, by1 = min(ys) - 3000, max(ys) + 3000
+            bx0, bx1 = min(xs) - pad_x, max(xs) + pad_x
+            by0, by1 = min(ys) - pad_y, max(ys) + pad_y
         else:
-            bx0, bx1 = hx - 12000, hx + 12000
-            by0, by1 = hy - 18000, hy + 6000
+            bx0, bx1 = hx - def_win_x, hx + def_win_x
+            by0, by1 = hy - def_win_y_down, hy + def_win_y_up
 
         panel_texts = [t for t in all_texts if bx0 <= t[1] <= bx1 and by0 <= t[2] <= by1]
 
@@ -257,7 +352,7 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
             note=meta["note"],
         ))
 
-        # 针对每个回路锚点，以水平 Y 轴带（tolerance ±550）提取该回路全部字段
+        # 针对每个回路锚点，以自适应水平 Y 轴带（tolerance ±row_y_tolerance）提取该回路全部字段
         c_anchors.sort(key=lambda item: -item[2])
         seen_circ_no = set()
         # 被回路 breaker 字段实际消费的文本：SPD 收集时跳过这些，
@@ -268,7 +363,7 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
                 continue
             seen_circ_no.add(cno)
 
-            band_items = [t for t in panel_texts if abs(t[2] - ay) <= 550 and t[0] != cno]
+            band_items = [t for t in panel_texts if abs(t[2] - ay) <= row_y_tolerance and t[0] != cno]
 
             circuit = Circuit(
                 box=code,
@@ -306,19 +401,82 @@ def extract_cad_table_data(dxf_or_doc: Any) -> RawExtraction:
 
             extracted_circuits.append(circuit)
 
-        # 查找该箱体的进线回路
-        incomers = [t for t in panel_texts if "引来" in t[0] or "进线" in t[0]]
+        # 查找该箱体的进线回路与进线总断路器
+        incomers = [t for t in panel_texts if any(k in t[0] for k in ["引来", "进线", "引入", "常用电源", "备用电源"])]
+
+        # 寻找箱体内未被出线回路消费的开关电器（位于母线上方/进线侧的主断路器）
+        unconsumed_breakers = [
+            t for t in panel_texts
+            if t[0] not in consumed_breaker_texts
+            and (RE_BREAKER.search(t[0]) or RE_BREAKER_FALLBACK.search(t[0]))
+            and not any(k in t[0].upper() for k in ("SPD", "浪涌", "电涌"))
+            and not (RE_CABLE.match(t[0]) or ("SC" in t[0] and any(cb in t[0] for cb in ["BV", "YJV", "RVV"])))
+        ]
+
+        inc_breaker = ""
+        inc_cable = ""
+        inc_note = ""
+
         if incomers:
-            inc_t = incomers[0][0]
+            inc_y = incomers[0][2]
+            inc_note = " ".join(t[0] for t in incomers)
+            # 优先在进线文字本身提取电缆，或在进线标高附近的水平带提取进线电缆
+            for t in incomers:
+                m_cb = RE_CABLE.match(t[0])
+                if m_cb:
+                    inc_cable = t[0]
+                    break
+            if not inc_cable:
+                for t in panel_texts:
+                    if abs(t[2] - inc_y) <= row_y_tolerance and (RE_CABLE.match(t[0]) or ("SC" in t[0] and any(cb in t[0] for cb in ["BV", "YJV", "RVV"]))):
+                        inc_cable = t[0]
+                        break
+
+        if unconsumed_breakers:
+            unconsumed_breakers.sort(key=lambda t: (
+                100 if any(k in t[0] for k in ("MCCB", "ATS", "3P", "4P", "NM", "NSX", "C65", "NXB")) else 0,
+                t[2]  # Y 坐标较高（进线总开关在上方）
+            ), reverse=True)
+            inc_breaker = unconsumed_breakers[0][0]
+            consumed_breaker_texts.add(inc_breaker)
+
+        if incomers or inc_breaker:
+            # 进线相序不得凭空填：图纸逐字标注的相序优先，没标就留空。
+            # 现场若确知该项目进线固定为三相五线制，可在 config/pipeline.json 的
+            # cad.incoming_phase_default 里显式设定，届时会在备注中标注这是规则假定。
+            incoming_phase = ""
+            incoming_note = inc_note or ("进线总开关" if inc_breaker else "")
+            for _item in panel_texts:
+                if RE_PHASE.match(str(_item[0]).strip()):
+                    incoming_phase = str(_item[0]).strip()
+                    break
+            assumption = str(_CAD_CONFIG.get("incoming_phase_default") or "")
+            if not incoming_phase and assumption:
+                incoming_phase = assumption
+                note_extra = str(_CAD_CONFIG.get("incoming_phase_assumption_note") or "")
+                if note_extra:
+                    incoming_note = (incoming_note + "；" + note_extra).strip("；")
             extracted_circuits.append(Circuit(
                 box=code,
                 circuit_no="进线",
-                phase="L1/L2/L3/N/PE",
-                breaker="",
-                cable="",
+                phase=incoming_phase,
+                breaker=inc_breaker,
+                cable=inc_cable,
                 load_name="进线",
-                note=inc_t,
+                note=incoming_note,
             ))
+
+        # 提取其他未被出线消费的独立主控制开关（如双电源备用开关/隔离刀闸），收入 extra_devices
+        for extra_b in unconsumed_breakers[1:]:
+            if extra_b[0] not in consumed_breaker_texts:
+                consumed_breaker_texts.add(extra_b[0])
+                extracted_devices.append(ExtraDevice(
+                    name="进线侧控制保护开关",
+                    spec=extra_b[0],
+                    unit="台",
+                    quantity=1.0,
+                    used_in=f"{code} 进线侧",
+                ))
 
         # 提取浪涌保护器等非回路器件。
         # 防双计：已被某回路 breaker 实际消费的文本不再收为 ExtraDevice

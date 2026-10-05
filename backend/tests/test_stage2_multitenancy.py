@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import test_support  # noqa: F401
 from fastapi.testclient import TestClient
 
 import app
@@ -23,8 +24,10 @@ class MultiTenancyIsolationTests(unittest.TestCase):
         db.init_db()
         self.client = TestClient(app.app)
         app.jobs.clear()
+        os.environ["ALLOW_UNAUTH_TENANT_HEADER"] = "1"
 
     def tearDown(self):
+        os.environ.pop("ALLOW_UNAUTH_TENANT_HEADER", None)
         app.WORKDIR = self.orig_workdir
         store.DATA_DIR = self.orig_data_dir
         db.set_current_tenant("default", "admin_default")

@@ -17,6 +17,8 @@ from extractor.render import plan_tiles, render_pdf
 from extractor.vision import VisionProvider, is_safe_model_url
 from extractor.checker import check_result, check_result_issues
 from extractor.assemble import assemble
+from extractor.corroborate import corroborate, corroboration_issues
+from extractor.config import config_health, delivery, domain, pipeline
 from extractor.schema import CONTRACT_VERSION, PROMPT_VERSION, Uncertainty, RawExtraction, ExtractionResult, Box
 from extractor.excel import build_workbook, build_project_bom_workbook
 from extractor.cad import is_cad_path, process_cad_file
@@ -33,6 +35,26 @@ import store
 BASE = os.path.dirname(os.path.abspath(__file__))
 WORKDIR = os.path.join(BASE, "work")
 os.makedirs(WORKDIR, exist_ok=True)
+
+# 运行口径全部来自 config/*.json；这里只做一次快照，便于在日志里看到实际生效的配置。
+_DELIVERY = delivery()
+_GATES = pipeline()["gates"]
+DEFAULT_TARGET_BRAND = _DELIVERY["brand"]["default_target"]
+DEFAULT_BASE_TITLE = _DELIVERY["labels"]["base_title"]
+EXPORT_FILENAME = _DELIVERY["labels"]["export_filename"]
+
+
+def config_replacement_brands() -> list:
+    """可平替的目标品牌清单来自 config/replacement.json，不再写死在接口里。"""
+    from extractor.config import replacement_rules
+    rules = replacement_rules()
+    brands = list(rules["series"].keys())
+    fallback = rules.get("fallback_brand")
+    if fallback in brands and brands[0] != fallback:
+        brands.remove(fallback)
+        brands.append(fallback)
+    return brands
+PROGRAM_WARNING_MARKERS = tuple(domain()["review"]["program_warning_markers"])
 
 try:
     from dotenv import load_dotenv
@@ -92,11 +114,28 @@ async def tenant_middleware(request: Request, call_next):
             t_id = "guest"
             u_id = "guest_user"
         else:
-            t_id = (request.headers.get("x-tenant-id") or
-                    request.query_params.get("tenant_id") or
-                    "default").strip() or "default"
-            u_id = (request.headers.get("x-user-id") or
-                    f"user_{t_id}").strip()
+            req_header_tenant = (request.headers.get("x-tenant-id") or
+                                 request.query_params.get("tenant_id") or "").strip()
+            allow_header_tenant = (os.environ.get("ENV") != "production" and
+                                   os.environ.get("ALLOW_UNAUTH_TENANT_HEADER", "0") == "1")
+
+            if req_header_tenant:
+                # 客户端显式试图指定租户：未认证请求仅在明确开启 ALLOW_UNAUTH_TENANT_HEADER 时允许
+                if allow_header_tenant:
+                    t_id = req_header_tenant
+                    u_id = (request.headers.get("x-user-id") or f"user_{t_id}").strip()
+                else:
+                    # 默认安全：禁止未认证请求任意指定 Header 冒用企业租户，强制降级为 guest 拦截
+                    t_id = "guest"
+                    u_id = "guest_user"
+            else:
+                # 未携带租户标头：生产环境强制 guest；本地/测试环境默认为 default
+                if os.environ.get("ENV") == "production":
+                    t_id = "guest"
+                    u_id = "guest_user"
+                else:
+                    t_id = "default"
+                    u_id = "user_default"
 
     set_current_tenant(t_id, u_id)
     response = await call_next(request)
@@ -231,13 +270,21 @@ def process_drawing_file(job_id: str, raw_path: str, filename: str):
             _fail(job_id, f"CAD 图纸转换解析失败: {exc}")
             return
 
-        # 优先使用 CAD 原生矢量拓扑提取器（零光栅化模糊、零大模型幻觉、零断路器空缺、100% 拓扑对齐）
+        # 优先尝试 CAD 原生矢量提取。准入条件（最少箱体/回路数、断路器填充率）来自 config。
         try:
             from extractor.cad_extractor import extract_cad_table_data
             cad_raw = extract_cad_table_data(raw_path)
-            if cad_raw.boxes and cad_raw.circuits:
-                process_cad_raw_extraction(job_id, pdf_path, filename, cad_raw)
-                return
+            if (len(cad_raw.boxes) >= int(_GATES["cad_min_boxes"])
+                    and len(cad_raw.circuits) >= int(_GATES["cad_min_circuits"])):
+                total_c = len(cad_raw.circuits)
+                circuits_with_breaker = sum(1 for c in cad_raw.circuits if (c.breaker or "").strip())
+                breaker_fill_rate = circuits_with_breaker / total_c if total_c > 0 else 0.0
+                min_fill = float(_GATES["cad_breaker_fill_rate_min"])
+                if breaker_fill_rate >= min_fill:
+                    process_cad_raw_extraction(job_id, pdf_path, filename, cad_raw)
+                    return
+                print(f"[CAD] 原生提取断路器填充率仅 {breaker_fill_rate:.1%} (<{min_fill:.0%})，"
+                      f"未通过准入门禁，自动回退到视觉大模型流水线")
         except Exception as cad_err:
             print(f"[CAD] 原生矢量提取降级至视觉模型: {cad_err}")
 
@@ -272,8 +319,135 @@ def _sync_result_issues(result: ExtractionResult, existing_uncertainties: list =
             result.uncertainties.append(parsed)
 
 
+from extractor.project_info import infer_from_texts, inferred_project_name, merge_info
+
+
+def _resolve_project_info(job: dict, raw: RawExtraction, cad_texts: list | None,
+                          pdf_path: str, filename: str) -> dict:
+    """确定这个任务所属项目：优先图上图签，其次文件名；都不行就不建项目。
+
+    返回 {project, name_source, info, note}；project 为空表示停在「未分组」，等人工归类。
+    本函数不编造工程名称，只决定“用哪个名字建项目”。
+    """
+    vision_info = None
+    raw_info = getattr(raw, "project_info", None)
+    if raw_info is not None and any((raw_info.name, raw_info.code, raw_info.client,
+                                     raw_info.designer, raw_info.location)):
+        vision_info = {"found": True, "name": raw_info.name, "code": raw_info.code,
+                       "client": raw_info.client, "designer": raw_info.designer,
+                       "location": raw_info.location, "source": "vision",
+                       "evidence": ["模型从图签读出"]}
+
+    native_lines, native_source = _native_text_lines(cad_texts, pdf_path)
+    native_info = infer_from_texts(native_lines)
+    if native_info.get("found"):
+        native_info["source"] = native_source
+
+    merged = merge_info(vision_info, native_info)
+
+    explicit = (job.get("project") or "").strip()
+    if explicit:
+        return {"project": explicit, "name_source": "manual", "info": merged,
+                "note": "上传时指定"}
+
+    name, name_source = inferred_project_name(merged, filename)
+    if not name:
+        return {"project": "", "name_source": "none", "info": merged,
+                "note": "图签与文件名都没给出可用项目名，已停在未分组，请人工归类"}
+    note = ("项目名取自图纸图签" if name_source == "drawing"
+            else "图上未识别到工程名称，项目名暂取自文件名，请核对后重命名")
+    return {"project": name, "name_source": name_source, "info": merged, "note": note}
+
+
+def _apply_project_assignment(job_id: str, decision: dict) -> None:
+    """把项目归属与从图纸提取的工程信息一起落库（项目 + 图纸归属同时定下来）。"""
+    project = (decision.get("project") or "").strip()
+    if not project:
+        return
+    info = decision.get("info") or {}
+    try:
+        row = store.ensure_project(project)
+        patch = {
+            "project_code": info.get("code") or row.get("project_code") or "",
+            "client_name": info.get("client") or row.get("client_name") or "",
+            "designer_institute": info.get("designer") or row.get("designer_institute") or "",
+            "location": info.get("location") or row.get("location") or "",
+            "info_json": {"evidence": info.get("evidence") or [],
+                          "source": info.get("source") or "",
+                          "found": bool(info.get("found"))},
+        }
+        # 只在来源尚未确定时写；已由人工命名的项目不被后续上传覆写
+        if not row.get("name_source") and decision.get("name_source"):
+            patch["name_source"] = decision["name_source"]
+        store.update_project(project, patch)
+        job = jobs.get(job_id)
+        if job is not None:
+            job["project"] = project
+            job["project_note"] = decision.get("note") or ""
+    except Exception as exc:  # noqa: BLE001 - 建项目失败不能拖垮已经提取完的数据
+        print(f"[project] 自动归入项目失败: {exc!r}")
+
+
+def _read_cad_texts(job_id: str) -> list | None:
+    """读取 CAD 原生解析阶段落盘的文字（如果有）。"""
+    path = os.path.join(WORKDIR, f"{job_id}_cad_texts.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:  # noqa: BLE001 - 文字层拿不到只影响交叉验证，不能拖垮主流程
+        print(f"[corroborate] 读取 CAD 原生文字失败: {exc!r}")
+        return None
+
+
+def _native_text_lines(cad_texts: list | None, pdf_path: str) -> tuple[list[str], str]:
+    """挑出本轮可用的、独立于模型自述的原生文字，返回 (语料行, 来源标记)。
+
+    优先用 CAD 原生矢量文字（最干净的真值来源）；没有才回到 PDF 内嵌文字层。
+    两者都没有时返回空列表——交叉验证就不会发生，如实反映到任务摘要，不假装通过。
+    """
+    if cad_texts:
+        lines = [str(t.get("text", "")).strip() for t in cad_texts if str(t.get("text", "")).strip()]
+        if lines:
+            return lines, "cad_native"
+    lines: list[str] = []
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        try:
+            for page in doc:
+                lines.extend((page.get_text("text") or "").splitlines())
+        finally:
+            doc.close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[corroborate] PDF 文字层读取失败: {exc!r}")
+    return [line.strip() for line in lines if line.strip()], "pdf_text"
+
+
+def _apply_corroboration(result: ExtractionResult, cad_texts: list | None, pdf_path: str) -> dict:
+    """用图纸原生文字给模型结论做独立交叉验证，并把结果接入待核对项。
+
+    只有 WARNING/ERROR 级别的交叉验证结果才写进《待核对》：图片型 PDF 天然没有原生文字，
+    这种“未能验证”的氛围提示放进任务摘要由前端横幅展示，不进入待核对清单，
+    避免每个任务都被一条恒定的 INFO 拖动，也不会因此阻断导出。
+    """
+    lines, source = _native_text_lines(cad_texts, pdf_path)
+    stats = corroborate(result, lines, source=source)
+    for issue in corroboration_issues(stats):
+        if str(issue.get("severity", "")).upper() == "INFO":
+            continue
+        item = Uncertainty(
+            location=issue["location"], detail=issue["detail"],
+            severity=issue["severity"], source="program",
+        )
+        if item.text not in {u.text for u in result.uncertainties}:
+            result.uncertainties.append(item)
+    return stats
+
+
 def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: RawExtraction):
-    """CAD 原生矢量数据专用处理分支：跳过模糊位图视觉推断，直接组装工业级高保真清单。"""
+    """处理 CAD 原生矢量提取结果；仍须经过字段、证据和覆盖核验，不能据此宣称清单完整或准确。"""
     job = jobs[job_id]
     try:
         job["status"] = "rendering"
@@ -282,14 +456,7 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
         job.update(status="extracting", pages=len(images), progress=80)
         save_job(job_id)
 
-        cad_texts = None
-        cad_json_path = os.path.join(WORKDIR, f"{job_id}_cad_texts.json")
-        if os.path.exists(cad_json_path):
-            try:
-                with open(cad_json_path, "r", encoding="utf-8") as f:
-                    cad_texts = json.load(f)
-            except Exception:
-                pass
+        cad_texts = _read_cad_texts(job_id)
 
         sheet_names: dict[str, str] = {}
         if cad_texts:
@@ -329,11 +496,16 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
                 )
 
         _sync_result_issues(result)
+        corroboration = _apply_corroboration(result, cad_texts, pdf_path)
+        # CAD 原生路径不做图像切块：几何来自矢量实体，渲染图仅用于交付预览。
+        slice_plan = {"total_images": len(images), "full_page": len(images),
+                      "tiles": 0, "tile_coverage": None}
+        project_decision = _resolve_project_info(job, raw, cad_texts, pdf_path, filename)
 
         job["status"] = "building_excel"
         xlsx = os.path.join(WORKDIR, f"{job_id}.xlsx")
         subtitle = (f"依据:{filename}  提取时间:{datetime.now():%Y-%m-%d %H:%M}"
-                    f"｜引擎:CAD高精度矢量拓扑解析器｜契约v{CONTRACT_VERSION}")
+                    f"｜引擎:CAD 矢量拓扑解析器｜契约v{CONTRACT_VERSION}")
         build_workbook(result, subtitle, xlsx,
                        template_path=store.settings().get("excel_template") or "",
                        layout="3_sheets")
@@ -361,6 +533,10 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
                 "components": len(result.components),
                 "uncertainties": [u.model_dump() for u in result.uncertainties],
                 "topology_nodes": len(getattr(result, "topology", [])),
+                "corroboration": corroboration,
+                "slice_plan": slice_plan,
+                "project_info": project_decision["info"],
+                "project_note": project_decision["note"],
                 "meta": meta,
             },
             data=data,
@@ -371,9 +547,25 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
             box_code=(result.boxes[0].code if result.boxes else ""),
             box_name=(result.boxes[0].name if result.boxes else ""),
         )
+        _apply_project_assignment(job_id, project_decision)
         save_job(job_id)
     except Exception as e:
         _fail(job_id, f"处理异常: {e}")
+
+
+def _slice_plan_summary(items: list[tuple]) -> dict:
+    """汇总本轮的切片计划，供前端/审计看到到底切了几块、是否铺满整页。"""
+    tiled = [item for item in items if item[2]]
+    coverage = None
+    if tiled:
+        last = items[-1][2]
+        coverage = last if isinstance(last, dict) else None
+    return {
+        "total_images": len(items),
+        "full_page": len(items) - len(tiled),
+        "tiles": len(tiled),
+        "tile_coverage": coverage,
+    }
 
 
 def process_pdf(job_id: str, pdf_path: str, filename: str):
@@ -396,14 +588,7 @@ def process_pdf(job_id: str, pdf_path: str, filename: str):
             jobs[job_id].update(progress=round(done / total * 100), current_page=page)
             save_job(job_id)
 
-        cad_texts = None
-        cad_json_path = os.path.join(WORKDIR, f"{job_id}_cad_texts.json")
-        if os.path.exists(cad_json_path):
-            try:
-                with open(cad_json_path, "r", encoding="utf-8") as f:
-                    cad_texts = json.load(f)
-            except Exception:
-                pass
+        cad_texts = _read_cad_texts(job_id)
 
         raw = provider.extract(items, on_progress=on_progress, cad_texts=cad_texts)
         _drop_tiles(pdf_path)
@@ -495,12 +680,23 @@ def process_pdf(job_id: str, pdf_path: str, filename: str):
                 print(f"[pdf_catalog] PDF原生目录嗅探跳过: {e}")
 
         _sync_result_issues(result)
+        corroboration = _apply_corroboration(result, cad_texts, pdf_path)
+        slice_plan = _slice_plan_summary(items)
+        project_decision = _resolve_project_info(job, raw, cad_texts, pdf_path, filename)
 
         job["status"] = "building_excel"
         save_job(job_id)
         xlsx = os.path.join(WORKDIR, f"{job_id}.xlsx")
+        ai_cost_str = ""
+        if usage_summary and (usage_summary.get("total_tokens") or usage_summary.get("calls_count")):
+            p_tok = usage_summary.get("prompt_tokens", 0)
+            c_tok = usage_summary.get("completion_tokens", 0)
+            t_tok = usage_summary.get("total_tokens", p_tok + c_tok)
+            c_tot = usage_summary.get("total_cost", 0.0)
+            ai_cost_str = f" ｜ Token消耗:{t_tok:,}(入:{p_tok:,}/出:{c_tok:,}) ｜ 模型费用:¥{c_tot:.4f}"
         subtitle = (f"依据:{filename}  提取时间:{datetime.now():%Y-%m-%d %H:%M}"
-                    f"｜模型:{provider.model}｜提示词v{PROMPT_VERSION}｜契约v{CONTRACT_VERSION}")
+                    f"｜模型:{provider.model}｜提示词v{PROMPT_VERSION}｜契约v{CONTRACT_VERSION}"
+                    f"{ai_cost_str}")
         build_workbook(result, subtitle, xlsx,
                        template_path=store.settings().get("excel_template") or "")
 
@@ -525,9 +721,14 @@ def process_pdf(job_id: str, pdf_path: str, filename: str):
                 "boxes": len(result.boxes),
                 "circuits": len(result.circuits),
                 "components": len(result.components),
+                "ai_usage": usage_summary,
                 "uncertainties": [u.model_dump() for u in result.uncertainties],
                 "reconciliation": result.reconciliation.model_dump() if getattr(result, "reconciliation", None) else None,
                 "topology_nodes": len(getattr(result, "topology", [])),
+                "corroboration": corroboration,
+                "slice_plan": slice_plan,
+                "project_info": project_decision["info"],
+                "project_note": project_decision["note"],
                 "meta": meta,
             },
             data=data,
@@ -538,18 +739,13 @@ def process_pdf(job_id: str, pdf_path: str, filename: str):
             box_code=(result.boxes[0].code if result.boxes else ""),
             box_name=(result.boxes[0].name if result.boxes else ""),
         )
+        _apply_project_assignment(job_id, project_decision)
         save_job(job_id)
     except Exception as e:  # noqa: BLE001
         _fail(job_id, f"处理异常: {e}")
 
 
-# 只出现在 checker.py / assemble.py 里的措辞，用于识别旧导出里没标来源的程序告警
-PROGRAM_WARNING_MARKERS = (
-    "回路逐条计数", "无法安全拆分", "未计入元器件汇总", "出现重复编号",
-    "不在常见值中", "需对照图纸核对", "箱体清单中未找到", "数量无效", "数量为",
-)
-
-
+# 旧导出里没标来源的程序告警识别标记，来自 config/domain.json 的 review 段
 def _legacy_raw(data: dict) -> tuple[dict, list, list]:
     """旧任务没有保存模型原始事实，从已导出的清单反推。
 
@@ -823,6 +1019,7 @@ def create_job(background: BackgroundTasks, file: UploadFile = File(...),
     project = (project or "").strip()
     if project:
         store.ensure_project(project)
+        store.update_project(project, {"name_source": "manual"})
     t_id = get_current_tenant()
     u_id = get_current_user()
     jobs[job_id] = {
@@ -844,20 +1041,31 @@ def create_job(background: BackgroundTasks, file: UploadFile = File(...),
 @app.post("/api/jobs/{job_id}/reparse")
 def reparse_job(job_id: str, background: BackgroundTasks):
     """基于服务器已保存的原始图纸文件原地重新执行提取与解析，无需重新上传。"""
-    _validate_job_id(job_id)
-    raw_path = None
-    for ext in (".dwg", ".pdf", ".dxf", ".DWG", ".PDF", ".DXF"):
-        cand = os.path.join(WORKDIR, f"{job_id}{ext}")
-        if os.path.exists(cand) and os.path.getsize(cand) > 0:
-            raw_path = cand
-            break
-
-    if not raw_path:
-        raise HTTPException(404, "找不到该任务的原始图纸源文件，无法重新解析")
-
     job_info = jobs.get(job_id) or load_job_cached(job_id)
     if job_info:
         check_job_tenant_access(job_info)
+
+    filename = (job_info or {}).get("filename") or ""
+    orig_ext = os.path.splitext(filename)[1].lower() if filename else ""
+
+    raw_path = None
+    # 优先使用原图原始扩展名匹配，避免 DXF 派生的 PDF 抢占原生 DXF
+    if orig_ext in (".dxf", ".dwg"):
+        for ext in (orig_ext, orig_ext.upper()):
+            cand = os.path.join(WORKDIR, f"{job_id}{ext}")
+            if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                raw_path = cand
+                break
+
+    if not raw_path:
+        for ext in (".dxf", ".dwg", ".DXF", ".DWG", ".pdf", ".PDF"):
+            cand = os.path.join(WORKDIR, f"{job_id}{ext}")
+            if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                raw_path = cand
+                break
+
+    if not raw_path:
+        raise HTTPException(404, "找不到该任务的原始图纸源文件，无法重新解析")
 
     filename = (job_info or {}).get("filename") or os.path.basename(raw_path)
     project = (job_info or {}).get("project") or ""
@@ -1250,7 +1458,7 @@ def job_chat(job_id: str, req: ChatRequest):
     rep_summary = {}
     if comps:
         from extractor.catalog import analyze_components_replacement
-        for b in ("正泰", "德力西", "良信"):
+        for b in config_replacement_brands():
             try:
                 rep_summary[b] = analyze_components_replacement(comps, target_brand=b)["summary"]
             except Exception:
@@ -1489,17 +1697,44 @@ def ai_deep_review(job_id: str):
     }
 
 
+def export_gate_enabled() -> bool:
+    """交付门禁开关，来自 config/delivery.json 的 export_gate.block_unresolved_default。
+
+    默认 false：**任何时候都能直接导出**，未确认的存疑项会如实写进 Excel 的待核对区。
+    导出是交付动作，不该被流程条条框框挡住；数据质量靠 Excel 里的待核对区体现，
+    而不是靠"不许下载"。
+    """
+    return bool(_DELIVERY.get("export_gate", {}).get("block_unresolved_default", False))
+
+
+def blocking_uncertainties(items: list | None) -> list:
+    """列出会阻断导出的条目——仅当门禁显式打开时才有意义。
+
+    分级来自 config/delivery.json 的 export_gate.blocking_severities（出厂 ERROR/WARNING）。
+    """
+    severities = {str(s).upper() for s in (_DELIVERY.get("export_gate", {})
+                                           .get("blocking_severities") or ["ERROR", "WARNING"])}
+    out = []
+    for item in items or []:
+        if not isinstance(item, dict) or item.get("resolved"):
+            continue
+        if str(item.get("severity", "WARNING")).upper() in severities:
+            out.append(item)
+    return out
+
+
 @app.get("/api/jobs/{job_id}/excel")
-def job_excel(job_id: str, target_brand: str = "正泰", force: bool = False):
+def job_excel(job_id: str, target_brand: str = "", force: bool = False):
+    target_brand = (target_brand or DEFAULT_TARGET_BRAND).strip() or DEFAULT_TARGET_BRAND
     _validate_job_id(job_id)
     job = load_job_cached(job_id)
     check_job_tenant_access(job)
 
     data = job.get("data") or {}
-    # 存疑未确认完不许导出（宁可标疑、不许编造）：未 resolved 的存疑存在且
-    # 未显式 force 时返回 409，不生成 Excel。force=True 为用户明确担责放行。
-    unresolved_list = [u for u in (data.get("uncertainties") or []) if not u.get("resolved")]
-    if unresolved_list and not force:
+    # 默认直接导出：未确认的存疑项会一并写进 Excel 的待核对区，不遮挡交付。
+    # 只有把 export_gate.block_unresolved_default 显式打开时才会拦（此时可用 force=true 单次放行）。
+    unresolved_list = blocking_uncertainties(data.get("uncertainties"))
+    if export_gate_enabled() and unresolved_list and not force:
         raise HTTPException(
             status_code=409,
             detail={
@@ -1515,7 +1750,7 @@ def job_excel(job_id: str, target_brand: str = "正泰", force: bool = False):
     recon_data = data.get("reconciliation") or (job.get("summary") or {}).get("reconciliation")
     topo_data = data.get("topology", []) or (job.get("summary") or {}).get("topology", [])
     result = ExtractionResult(
-        title=(job.get("summary") or {}).get("title") or "配电箱元器件清单(报价用)",
+        title=(job.get("summary") or {}).get("title") or DEFAULT_BASE_TITLE,
         boxes=data.get("boxes", []),
         circuits=data.get("circuits", []),
         components=data.get("components", []),
@@ -1525,8 +1760,16 @@ def job_excel(job_id: str, target_brand: str = "正泰", force: bool = False):
         reconciliation=recon_data,
     )
     filename = job.get("filename", f"{job_id}.pdf")
+    ai_usage = job.get("ai_usage") or (job.get("summary") or {}).get("ai_usage") or {}
+    ai_cost_str = ""
+    if ai_usage and (ai_usage.get("total_tokens") or ai_usage.get("calls_count")):
+        p_tok = ai_usage.get("prompt_tokens", 0)
+        c_tok = ai_usage.get("completion_tokens", 0)
+        t_tok = ai_usage.get("total_tokens", p_tok + c_tok)
+        c_tot = ai_usage.get("total_cost", 0.0)
+        ai_cost_str = f" ｜ Token消耗:{t_tok:,}(入:{p_tok:,}/出:{c_tok:,}) ｜ 模型费用:¥{c_tot:.4f}"
     subtitle = (f"依据:{filename}  导出时间:{datetime.now():%Y-%m-%d %H:%M}  "
-                f"｜平替品牌:{target_brand}｜契约v{CONTRACT_VERSION}")
+                f"｜平替品牌:{target_brand}｜契约v{CONTRACT_VERSION}{ai_cost_str}")
     build_workbook(
         result, subtitle, xlsx,
         changes=job.get("changes", []),
@@ -1548,7 +1791,7 @@ def job_excel(job_id: str, target_brand: str = "正泰", force: bool = False):
         "changes": len(job.get("changes", [])),
         "size": os.path.getsize(xlsx),
     })
-    return FileResponse(xlsx, filename=f"配电箱元器件清单(报价用)-{job_id}-{target_brand}平替.xlsx")
+    return FileResponse(xlsx, filename=f"{DEFAULT_BASE_TITLE}-{job_id}-{target_brand}平替.xlsx")
 
 
 class RevertRequest(BaseModel):
@@ -1771,6 +2014,11 @@ def get_job_catalog_reconciliation(job_id: str):
     return reconciliation
 
 
+def visible_project_names(names: list, grouped: dict) -> list:
+    """「未分组」只是兜底桶，不是用户建的项目：里面没图纸就不必占一行。"""
+    return [n for n in names if n != "未分组" or grouped.get("未分组")]
+
+
 @app.get("/api/projects")
 def list_projects():
     jobs = list_jobs()["jobs"]
@@ -1779,12 +2027,21 @@ def list_projects():
         grouped.setdefault(job.get("project") or "未分组", []).append(job)
     names = list(dict.fromkeys(store.project_names() + list(grouped)))
     stored_projects = {p.get("name"): p for p in store.projects()}
+    names = visible_project_names(names, grouped)
     out = []
     for name in names:
         items = grouped.get(name, [])
         p_info = stored_projects.get(name) or {}
         out.append({
             "name": name,
+            # 工程信息：来自图纸图签自动提取，人工可改
+            "project_code": p_info.get("project_code") or "",
+            "client_name": p_info.get("client_name") or "",
+            "designer_institute": p_info.get("designer_institute") or "",
+            "location": p_info.get("location") or "",
+            "status": p_info.get("status") or "active",
+            "note": p_info.get("note") or "",
+            "name_source": p_info.get("name_source") or "",
             "jobs": items,
             "totals": {
                 "drawings": len(items),
@@ -1801,9 +2058,19 @@ def list_projects():
             "ai_prompt_tokens": int(p_info.get("ai_prompt_tokens", 0)),
             "ai_completion_tokens": int(p_info.get("ai_completion_tokens", 0)),
             "currency": "￥",
-            "updated_at": max([j.get("created_at", "") for j in items] or [""]),
+            "updated_at": max([j.get("created_at", "") for j in items] or [p_info.get("updated_at") or ""]),
         })
     return {"projects": out}
+
+
+@app.get("/api/projects/{name}")
+def get_project(name: str):
+    """单个项目详情：项目页只调这一个接口就能渲染完整页。"""
+    all_projects = list_projects()["projects"]
+    found = next((p for p in all_projects if p["name"] == name), None)
+    if not found:
+        raise HTTPException(404, "项目不存在")
+    return {"project": found}
 
 
 @app.get("/api/ai_logs")
@@ -1821,14 +2088,63 @@ def get_project_ai_logs_api(name: str):
 
 class ProjectRequest(BaseModel):
     name: str
+    project_code: str | None = None
+    client_name: str | None = None
+    designer_institute: str | None = None
+    location: str | None = None
+    status: str | None = None
+    note: str | None = None
+
+
+class ProjectPatchRequest(BaseModel):
+    project_code: str | None = None
+    client_name: str | None = None
+    designer_institute: str | None = None
+    location: str | None = None
+    status: str | None = None
+    note: str | None = None
+
+
+class ProjectRenameRequest(BaseModel):
+    new_name: str
 
 
 @app.post("/api/projects")
 def create_project(req: ProjectRequest):
     try:
-        return {"ok": True, "project": store.ensure_project(req.name)}
+        project = store.ensure_project(req.name)
+        patch = {k: v for k, v in req.model_dump().items()
+                 if k not in ("name",) and v is not None}
+        patch["name_source"] = "manual"
+        updated = store.update_project(req.name, patch) or project
+        return {"ok": True, "project": updated}
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.patch("/api/projects/{name}")
+def patch_project(name: str, req: ProjectPatchRequest):
+    """人工修正项目工程信息（自动识别的结果不一定对，必须能改）。"""
+    if name not in store.project_names():
+        raise HTTPException(404, "项目不存在")
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not patch:
+        return {"ok": True, "project": None}
+    return {"ok": True, "project": store.update_project(name, patch)}
+
+
+@app.post("/api/projects/{name}/rename")
+def rename_project(name: str, req: ProjectRenameRequest):
+    """项目改名：projects / 图纸 / 账单三处同步，避免留下孤儿数据。"""
+    try:
+        result = store.rename_project(name, req.new_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    for job_id, job in list(jobs.items()):
+        if (job.get("project") or "") == name:
+            job["project"] = result["name"]
+            save_job(job_id)
+    return {"ok": True, **result}
 
 
 @app.get("/api/projects/{name}/bom")
@@ -1931,7 +2247,8 @@ def get_project_topology(name: str):
 
 
 @app.get("/api/projects/{name}/export_bom")
-def export_project_bom(name: str, target_brand: str = "正泰"):
+def export_project_bom(name: str, target_brand: str = "", force: bool = False):
+    target_brand = (target_brand or DEFAULT_TARGET_BRAND).strip() or DEFAULT_TARGET_BRAND
     """生成并下载全项目采购总清单（含BOM总表、集中采购平替方案、设备台账、成套辅材测算、统一技术规范）。"""
     all_jobs = list_jobs()["jobs"]
     jobs_list = [j for j in all_jobs if (j.get("project") or "未分组") == name]
@@ -1939,10 +2256,30 @@ def export_project_bom(name: str, target_brand: str = "正泰"):
         raise HTTPException(404, "项目暂无已完成的图纸数据")
 
     full_jobs = []
+    all_unresolved = []
     for j in jobs_list:
         job_data = load_job_cached(j["job_id"])
         if job_data:
             full_jobs.append(job_data)
+            j_data = job_data.get("data") or {}
+            for u in blocking_uncertainties(j_data.get("uncertainties")):
+                all_unresolved.append({
+                    "job_id": job_data.get("job_id"),
+                    "filename": job_data.get("filename", ""),
+                    "location": u.get("location", ""),
+                    "detail": u.get("detail", "")
+                })
+
+    # 同上：默认不拦，未确认项照样随项目清单导出
+    if export_gate_enabled() and all_unresolved and not force:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"项目存在 {len(all_unresolved)} 处存疑未确认，无法导出项目采购清单",
+                "unresolved_count": len(all_unresolved),
+                "unresolved": all_unresolved,
+            },
+        )
 
     out_filename = f"项目采购总清单(BOM)-{name}-{target_brand}平替.xlsx"
     out_path = os.path.join(WORKDIR, f"project_{uuid.uuid4().hex[:8]}.xlsx")
@@ -1986,6 +2323,9 @@ def export_history():
 def get_settings():
     return {
         "settings": store.public_settings(),
+        # 平替品牌与默认品牌由后端配置提供，前端不再写死品牌清单
+        "target_brands": config_replacement_brands(),
+        "default_target_brand": DEFAULT_TARGET_BRAND,
         "prompt_version": PROMPT_VERSION,
         "contract_version": CONTRACT_VERSION,
         "vision_model": VisionProvider().model,
@@ -2036,7 +2376,8 @@ def put_settings(req: SettingsRequest, request: Request = None):
 
 
 @app.get("/api/jobs/{job_id}/replacements")
-def get_job_replacements(job_id: str, target_brand: str = "正泰"):
+def get_job_replacements(job_id: str, target_brand: str = ""):
+    target_brand = (target_brand or DEFAULT_TARGET_BRAND).strip() or DEFAULT_TARGET_BRAND
     """一键国产化平替测算：分析图纸中的外资/竞品元器件并推荐高性价比替代型号。"""
     _validate_job_id(job_id)
     job = load_job_cached(job_id)
@@ -2047,7 +2388,8 @@ def get_job_replacements(job_id: str, target_brand: str = "正泰"):
 
 
 @app.get("/api/projects/{name}/replacements")
-def get_project_replacements(name: str, target_brand: str = "正泰"):
+def get_project_replacements(name: str, target_brand: str = ""):
+    target_brand = (target_brand or DEFAULT_TARGET_BRAND).strip() or DEFAULT_TARGET_BRAND
     """全项目一键平替降本测算：跨箱体汇总元器件并输出国产化替代与降本预算。"""
     all_jobs = list_jobs()["jobs"]
     jobs_list = [j for j in all_jobs if (j.get("project") or "未分组") == name]
@@ -2133,22 +2475,22 @@ def auth_logout(request: Request):
 @app.post("/api/system/clean_test_data")
 def clean_test_data(request: Request = None):
     """彻底清空系统内所有测试数据，还原纯净环境（受管理员鉴权与生产保护拦截）。"""
+    if os.environ.get("ENV") == "production":
+        raise HTTPException(403, "生产环境保护：禁止调用全系统数据清理接口")
+
     if request is not None:
         if getattr(request.state, "invalid_token", False):
             raise HTTPException(401, "无效或过期的登录凭证")
         if get_current_tenant() == "guest":
             raise HTTPException(403, "访客身份无权执行数据清空")
 
-    if os.environ.get("ENV") == "production":
-        raise HTTPException(403, "生产环境保护：禁止调用全系统数据清理接口")
-
     user = getattr(request.state, "user", None) if request is not None else None
     is_admin = user and user.get("role") == "admin"
-    is_test_mode = os.environ.get("ALLOW_TEST_CLEANUP", "1") == "1"
+    is_test_mode = os.environ.get("ALLOW_TEST_CLEANUP", "0") == "1"
     if not is_admin and not is_test_mode:
-        raise HTTPException(403, "权限不足：仅系统管理员角色可执行数据清空")
+        raise HTTPException(403, "权限不足：仅系统管理员角色或明确启用测试清理时可执行数据清空")
 
-    res = db_clean_all_test_data()
+    res = db_clean_all_test_data(work_dir=WORKDIR)
     jobs.clear()
     return res
 
@@ -2159,5 +2501,3 @@ def health():
 
 
 app.mount("/", StaticFiles(directory=os.path.join(BASE, "..", "frontend"), html=True), name="frontend")
-
-

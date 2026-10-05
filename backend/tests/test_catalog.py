@@ -40,25 +40,36 @@ class TestCatalogReplacement(unittest.TestCase):
         self.assertEqual(res3["rated_amp"], 100.0)
 
     def test_recommend_replacements(self):
-        # 施耐德微断替换为正泰
+        # 用本地价格库记录验证候选价差计算；该测试不证明来源或采购价格有效性。
         rec_chint = recommend_replacements("微型断路器", "施耐德 iC65N 1P C16A", target_brand="正泰")
         self.assertEqual(rec_chint["original_brand"], "施耐德")
         self.assertEqual(rec_chint["target_brand"], "正泰")
         self.assertEqual(rec_chint["recommended_model"], "NXB-63 C16/1P")
-        self.assertEqual(rec_chint["estimated_saving_pct"], 45)
+        self.assertEqual(rec_chint["estimated_saving_pct"], 40)
         self.assertIn("16A", rec_chint["matching_notes"])
+        self.assertIn("实价实算", rec_chint["matching_notes"])
 
         # 施耐德漏电替换为德力西
         rec_delixi = recommend_replacements("漏电断路器", "施耐德 iDPN Vigi 1P+N C20A 30mA", target_brand="德力西")
         self.assertEqual(rec_delixi["target_brand"], "德力西")
         self.assertEqual(rec_delixi["recommended_model"], "CDB6LE-63 C20/1P+N 30mA")
-        self.assertEqual(rec_delixi["estimated_saving_pct"], 45)
+        self.assertGreaterEqual(rec_delixi["estimated_saving_pct"], 35)
 
         # ABB 塑壳替换为良信
         rec_nader = recommend_replacements("塑壳断路器", "ABB XT1N 160 TMD 100A 3P", target_brand="良信")
         self.assertEqual(rec_nader["target_brand"], "良信")
         self.assertEqual(rec_nader["recommended_model"], "NDM1-125S/3300 100A 3P")
-        self.assertEqual(rec_nader["estimated_saving_pct"], 35)
+        self.assertGreaterEqual(rec_nader["estimated_saving_pct"], 30)
+
+        # 10kA 高分断能力对标与安全核验
+        rec_10ka = recommend_replacements("微型断路器", "施耐德 iC65H C32/2P 10kA", target_brand="正泰")
+        self.assertEqual(rec_10ka["recommended_series"], "NXB-63H")
+        self.assertIn("10kA 高分断", rec_10ka["matching_notes"])
+
+        # 缺失额定电流严禁盲目填充 16A/1P
+        parsed_no_amp = parse_component_spec("微型断路器", "DZ47-63")
+        self.assertIsNone(parsed_no_amp["rated_amp"])
+        self.assertIn("待核电流", parsed_no_amp["standard_spec"])
 
     def test_analyze_components_replacement(self):
         comps = [

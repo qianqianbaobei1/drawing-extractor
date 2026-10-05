@@ -1,20 +1,33 @@
 import base64
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, time as datetime_time
+from functools import lru_cache
+import http.client
 import json
 import os
 import re
 import threading
+import time
+import urllib.error
 import urllib.request
+from zoneinfo import ZoneInfo
 from pydantic import ValidationError
 
 import ipaddress
 import socket
 from urllib.parse import urlparse
 
+from .config import vision as _vision_config
 from .schema import (Box, Circuit, ExtraDevice, RawExtraction, Requirement, Uncertainty)
 
-REQUIRED_SECTIONS = {"boxes", "circuits", "extra_devices", "requirements", "uncertainties"}
+# 调用参数与解析门禁全部来自 config/vision.json
+_VISION = _vision_config()
+_TRANSPORT = _VISION["transport"]
+_GENERATION = _VISION["generation"]
+_PARSE_GATE = _VISION["parse_gate"]
+
+REQUIRED_SECTIONS = set(_PARSE_GATE["required_sections"])
+JSON_REPAIR_ATTEMPTS = int(_PARSE_GATE["json_repair_attempts"])
 
 
 def is_safe_model_url(url: str) -> tuple[bool, str]:
@@ -76,33 +89,88 @@ def is_safe_model_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
-def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> dict:
-    """按模型官方定价估算 Token 调用费用（单位：元）。"""
-    m = (model or "").lower()
-    if "deepseek" in m:
-        rate_in = 1.0 / 1_000_000
-        rate_out = 2.0 / 1_000_000
-    elif "gpt-4o-mini" in m:
-        rate_in = 1.1 / 1_000_000
-        rate_out = 4.4 / 1_000_000
-    elif "gpt-4" in m:
-        rate_in = 18.0 / 1_000_000
-        rate_out = 72.0 / 1_000_000
-    elif "qwen" in m:
-        rate_in = 1.5 / 1_000_000
-        rate_out = 3.5 / 1_000_000
-    else:
-        rate_in = 2.0 / 1_000_000
-        rate_out = 4.0 / 1_000_000
+@lru_cache(maxsize=1)
+def _load_model_pricing() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "..", "config", "model_pricing.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
 
-    cost_in = prompt_tokens * rate_in
-    cost_out = completion_tokens * rate_out
-    total_cost = cost_in + cost_out
+
+def _deepseek_period(now: datetime | None, windows: list[dict]) -> str:
+    override = os.environ.get("VISION_PRICING_PERIOD", "").strip().lower()
+    if override in {"peak", "off_peak"}:
+        return override
+    local_now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    else:
+        local_now = local_now.astimezone(ZoneInfo("Asia/Shanghai"))
+    for window in windows:
+        if local_now.weekday() in window.get("weekdays", []):
+            start_h, start_m = map(int, window["start"].split(":"))
+            end_h, end_m = map(int, window["end"].split(":"))
+            if datetime_time(start_h, start_m) <= local_now.time().replace(tzinfo=None) < datetime_time(end_h, end_m):
+                return "peak"
+    return "off_peak"
+
+
+def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int,
+                  prompt_cache_hit_tokens: int = 0, prompt_cache_miss_tokens: int = 0,
+                  now: datetime | None = None) -> dict:
+    """Use a dated, sourced rate card. Unknown models have unknown cost, never a guessed default rate."""
+    pricing = _load_model_pricing()
+    model_key = (model or "").strip().lower()
+    model_key = pricing.get("aliases", {}).get(model_key, model_key)
+    model_rates = pricing.get("models", {}).get(model_key)
+    base = {
+        "currency": "CNY",
+        "pricing_available": False,
+        "pricing_status": "unknown_model_rate",
+        "pricing_source": "",
+        "pricing_effective_from": "",
+        "pricing_period": "unknown",
+        "cost_in": 0.0,
+        "cost_out": 0.0,
+        "total_cost": 0.0,
+    }
+    if not model_rates:
+        return base
+
+    period = _deepseek_period(now, model_rates.get("peak_windows", []))
+    rates = model_rates.get(period, {})
+    required_rates = ("cache_hit", "cache_miss", "output")
+    if any(key not in rates for key in required_rates):
+        return {**base, "pricing_status": "incomplete_rate_card", "pricing_source": model_rates.get("source", "")}
+
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    completion_tokens = max(0, int(completion_tokens or 0))
+    hit = max(0, int(prompt_cache_hit_tokens or 0))
+    miss = max(0, int(prompt_cache_miss_tokens or 0))
+    if hit or miss:
+        # Do not charge more cache tokens than the API reports as prompt tokens.
+        hit = min(hit, prompt_tokens)
+        miss = min(miss, max(0, prompt_tokens - hit))
+        if hit + miss < prompt_tokens:
+            miss += prompt_tokens - hit - miss
+    else:
+        miss = prompt_tokens
+
+    per_million = 1_000_000.0
+    cost_in = (hit * float(rates["cache_hit"]) + miss * float(rates["cache_miss"])) / per_million
+    cost_out = completion_tokens * float(rates["output"]) / per_million
     return {
-        "currency": "￥",
-        "cost_in": round(cost_in, 5),
-        "cost_out": round(cost_out, 5),
-        "total_cost": round(total_cost, 5),
+        "currency": pricing.get("currency", "CNY"),
+        "pricing_available": True,
+        "pricing_status": "estimated_peak_schedule" if period == "peak" else "estimated_off_peak_schedule",
+        "pricing_source": model_rates.get("source", ""),
+        "pricing_effective_from": model_rates.get("effective_from", ""),
+        "pricing_period": period,
+        "cost_in": round(cost_in, 8),
+        "cost_out": round(cost_out, 8),
+        "total_cost": round(cost_in + cost_out, 8),
     }
 
 
@@ -119,19 +187,50 @@ def _data_url(image_path: str) -> str:
     return f"data:image/png;base64,{b64}"
 
 
-def post_chat(base_url: str, api_key: str, payload: dict, timeout: int = 300) -> dict:
-    """OpenAI 兼容的 chat/completions 调用，视觉提取与助手问答共用。"""
+def post_chat(base_url: str, api_key: str, payload: dict, timeout: int | None = None,
+              max_retries: int | None = None) -> dict:
+    timeout = int(_TRANSPORT["timeout_s"] if timeout is None else timeout)
+    max_retries = int(_TRANSPORT["max_retries"] if max_retries is None else max_retries)
+    """OpenAI 兼容的 chat/completions 调用，视觉提取与助手问答共用。
+    具备针对 HTTP 429 限流及临时 5xx / 网络超时的指数退避重试机制。
+    """
     safe, reason = is_safe_model_url(base_url)
     if not safe:
         raise ValueError(f"模型外联调用受阻：{reason}")
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/chat/completions", data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {api_key}"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    req_url = f"{base_url.rstrip('/')}/chat/completions"
+    data = json.dumps(payload).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(req_url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            # 针对 429 (Too Many Requests) 或临时 502/503/504 进行指数退避重试
+            if e.code in (429, 502, 503, 504) and attempt < max_retries:
+                retry_after = e.headers.get("Retry-After") if hasattr(e, "headers") else None
+                if retry_after and retry_after.isdigit():
+                    wait_sec = min(float(retry_after), 30.0)
+                else:
+                    wait_sec = (2 ** attempt) * 1.5  # 1.5s, 3.0s, 6.0s
+                time.sleep(wait_sec)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError) as e:
+            last_exc = e
+            if attempt < max_retries:
+                wait_sec = (2 ** attempt) * 1.0
+                time.sleep(wait_sec)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
 
 
 def _clip_to_page(box, clip: dict | None):
@@ -204,13 +303,24 @@ def merge_parts(parts: list, ) -> RawExtraction:
         extra_devices=[x for x in picked if isinstance(x, ExtraDevice)],
         requirements=[x for x in picked if isinstance(x, Requirement)],
         uncertainties=[x for x in picked if isinstance(x, Uncertainty)],
+        project_info=_first_project_info([raw for raw, _ in parts]),
     )
+
+
+def _first_project_info(raws: list):
+    """一页/一张图的项目信息取第一个有内容的即可：同一份图纸的图签是一致的。"""
+    for raw in raws or []:
+        info = getattr(raw, "project_info", None)
+        if info and any((info.name, info.code, info.client, info.designer, info.location)):
+            return info
+    return None
 
 
 def concat_results(results: list) -> RawExtraction:
     """跨页拼接，不去重：不同页上编号相同的箱体要留给 assemble 报重复。"""
     out = RawExtraction(boxes=[], circuits=[], extra_devices=[],
-                        requirements=[], uncertainties=[])
+                        requirements=[], uncertainties=[],
+                        project_info=_first_project_info(results))
     for raw in results:
         out.boxes.extend(raw.boxes)
         out.circuits.extend(raw.circuits)
@@ -226,13 +336,24 @@ class VisionProvider:
     """Calls an OpenAI-compatible vision chat API and returns parsed JSON."""
 
     def __init__(self):
-        self.api_key = os.environ.get("VISION_API_KEY", "")
-        self.base_url = os.environ.get("VISION_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        self.model = os.environ.get("VISION_MODEL", "gpt-4o")
-        self.temperature = _float_env("VISION_TEMPERATURE", 0.0)
-        self.seed = os.environ.get("VISION_SEED") or None
+        try:
+            import store
+            cfg = store.settings()
+        except Exception:
+            cfg = {}
+        self.api_key = cfg.get("vision_api_key") or os.environ.get("VISION_API_KEY", "")
+        self.base_url = (cfg.get("vision_base_url") or os.environ.get("VISION_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
+        self.model = cfg.get("vision_model") or os.environ.get("VISION_MODEL", "gpt-4o")
+        default_temp = float(_GENERATION["temperature"])
+        self.temperature = (float(cfg.get("temperature", default_temp))
+                            if cfg.get("temperature") is not None
+                            else _float_env("VISION_TEMPERATURE", default_temp))
+        self.seed = cfg.get("seed") or os.environ.get("VISION_SEED") or _GENERATION.get("seed")
+        self.detail = str(_GENERATION.get("detail") or "high")
+        self.max_tokens = int(_GENERATION.get("max_tokens") or 8192)
         self.last_call_logs = []
         self.last_usage_summary = {}
+        self.api_call_attempts = 0
         self._log_lock = threading.Lock()
         with open(os.path.join(os.path.dirname(__file__), "..", "prompts", "extract.txt"),
                   encoding="utf-8") as f:
@@ -243,24 +364,44 @@ class VisionProvider:
         return bool(self.api_key)
 
     def _call(self, payload: dict) -> dict:
+        self.api_call_attempts += 1
         return post_chat(self.base_url, self.api_key, payload)
 
     def _record_usage(self, data: dict) -> dict:
         usage = data.get("usage") or {}
+        usage_available = any(k in usage for k in ("prompt_tokens", "completion_tokens", "total_tokens"))
         p_tok = int(usage.get("prompt_tokens", 0) or 0)
         c_tok = int(usage.get("completion_tokens", 0) or 0)
         t_tok = int(usage.get("total_tokens", p_tok + c_tok) or 0)
-        cost_info = estimate_cost(self.model, p_tok, c_tok)
+        p_hit = int(usage.get("prompt_cache_hit_tokens", 0) or 0)
+        p_miss = int(usage.get("prompt_cache_miss_tokens", 0) or (p_tok - p_hit))
+        reasoning_tok = int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0)
+        cost_info = estimate_cost(self.model, p_tok, c_tok,
+                                  prompt_cache_hit_tokens=p_hit,
+                                  prompt_cache_miss_tokens=p_miss)
+        if not usage_available:
+            cost_info = {
+                **cost_info,
+                "pricing_available": False,
+                "pricing_status": "api_usage_missing",
+            }
         entry = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "model": self.model,
             "prompt_tokens": p_tok,
+            "prompt_cache_hit_tokens": p_hit,
+            "prompt_cache_miss_tokens": p_miss,
             "completion_tokens": c_tok,
+            "reasoning_tokens": reasoning_tok,
             "total_tokens": t_tok,
             "cost_in": cost_info["cost_in"],
             "cost_out": cost_info["cost_out"],
             "total_cost": cost_info["total_cost"],
             "currency": cost_info["currency"],
+            "pricing_available": cost_info["pricing_available"],
+            "pricing_status": cost_info["pricing_status"],
+            "pricing_source": cost_info["pricing_source"],
+            "pricing_period": cost_info["pricing_period"],
         }
         with self._log_lock:
             self.last_call_logs.append(entry)
@@ -268,22 +409,37 @@ class VisionProvider:
 
     def _summarize_usage(self) -> dict:
         with self._log_lock:
-            total_p = sum(l["prompt_tokens"] for l in self.last_call_logs)
-            total_c = sum(l["completion_tokens"] for l in self.last_call_logs)
-            total_t = sum(l["total_tokens"] for l in self.last_call_logs)
-            total_in = round(sum(l["cost_in"] for l in self.last_call_logs), 5)
-            total_out = round(sum(l["cost_out"] for l in self.last_call_logs), 5)
-            total_all = round(sum(l["total_cost"] for l in self.last_call_logs), 5)
+            total_p = sum(l.get("prompt_tokens", 0) for l in self.last_call_logs)
+            total_hit = sum(l.get("prompt_cache_hit_tokens", 0) for l in self.last_call_logs)
+            total_miss = sum(l.get("prompt_cache_miss_tokens", 0) for l in self.last_call_logs)
+            total_c = sum(l.get("completion_tokens", 0) for l in self.last_call_logs)
+            total_r = sum(l.get("reasoning_tokens", 0) for l in self.last_call_logs)
+            total_t = sum(l.get("total_tokens", 0) for l in self.last_call_logs)
+            total_in = round(sum(l.get("cost_in", 0.0) for l in self.last_call_logs), 5)
+            total_out = round(sum(l.get("cost_out", 0.0) for l in self.last_call_logs), 5)
+            known_logs = [l for l in self.last_call_logs if l.get("pricing_available")]
+            total_all = round(sum(l.get("total_cost", 0.0) for l in known_logs), 8)
+            total_cost_in_known = round(sum(l.get("cost_in", 0.0) for l in known_logs), 8)
+            total_cost_out_known = round(sum(l.get("cost_out", 0.0) for l in known_logs), 8)
+            pricing_complete = bool(self.last_call_logs) and len(known_logs) == len(self.last_call_logs)
             self.last_usage_summary = {
                 "model": self.model,
                 "calls_count": len(self.last_call_logs),
+                "api_call_attempts": self.api_call_attempts,
                 "prompt_tokens": total_p,
+                "prompt_cache_hit_tokens": total_hit,
+                "prompt_cache_miss_tokens": total_miss,
                 "completion_tokens": total_c,
+                "reasoning_tokens": total_r,
                 "total_tokens": total_t,
-                "cost_in": total_in,
-                "cost_out": total_out,
+                "cost_in": total_cost_in_known,
+                "cost_out": total_cost_out_known,
                 "total_cost": total_all,
                 "currency": "￥",
+                "pricing_available": pricing_complete,
+                "pricing_status": "complete" if pricing_complete else "partial_or_unknown",
+                "pricing_sources": sorted({l.get("pricing_source", "") for l in self.last_call_logs if l.get("pricing_source")}),
+                "pricing_periods": sorted({l.get("pricing_period", "") for l in self.last_call_logs if l.get("pricing_period")}),
                 "logs": list(self.last_call_logs),
             }
             return self.last_usage_summary
@@ -291,12 +447,13 @@ class VisionProvider:
     def extract(self, items: list, on_progress=None, cad_texts: list | None = None) -> RawExtraction:
         """items 形如 [(图片路径, 页码, 该图对应整页的归一化区域或 None=整页)]。
 
-        支持多线程并发调用视觉大模型，动态规避单线程网络排队延迟，
-        同时按页码与切片拓扑保证结果收集与组装的绝对确定性。
+        支持可配置的多线程调用；按输入索引收集返回结果，避免线程完成顺序改变组装顺序。
+        并发、响应稳定性与内容准确率仍需按真实工作负载测量。
         """
         with self._log_lock:
             self.last_call_logs = []
             self.last_usage_summary = {}
+            self.api_call_attempts = 0
         if not items:
             return RawExtraction(boxes=[], circuits=[], extra_devices=[],
                                  requirements=[], uncertainties=[])
@@ -323,7 +480,8 @@ class VisionProvider:
             native_lines = [t.get("text", "").strip() for t in page_cad if t.get("text")]
             return "\n".join(native_lines[:300])
 
-        concurrency = max(1, int(os.environ.get("VISION_CONCURRENCY", "6")))
+        default_concurrency = int(_TRANSPORT.get("concurrency") or 6)
+        concurrency = max(1, int(os.environ.get("VISION_CONCURRENCY", default_concurrency)))
 
         # 单张切片直接在主线程执行，零线程开销
         if len(items) == 1 or concurrency == 1:
@@ -376,12 +534,14 @@ class VisionProvider:
         content_text = "请按系统提示词提取这张配电系统图中的全部元器件信息，只输出 JSON。"
         if native_text:
             content_text += (
-                "\n\n【图纸原生 CAD 几何文本层（AutoCAD 数据库直读，字符100%精确无 OCR 误差，请结合视觉图纸优先对标以下内容）】：\n"
+                "\n\n【CAD 原生文字实体摘录（只是可获得的源文字记录，不保证完整、无乱码或语义正确；"
+                "请与图纸渲染图逐项核对，不得默认其覆盖全部表格、符号或回路。若二者冲突，列入 uncertainties，"
+                "不要静默覆盖图纸可见内容）】：\n"
                 + native_text[:4000]
             )
         content = [{"type": "text", "text": content_text}]
         content.append({"type": "image_url",
-                        "image_url": {"url": _data_url(image_path), "detail": "high"}})
+                        "image_url": {"url": _data_url(image_path), "detail": self.detail}})
         payload = {
             "model": self.model,
             "messages": [
@@ -389,7 +549,7 @@ class VisionProvider:
                 {"role": "user", "content": content},
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": 12000,
+            "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
         if self.base_url.startswith("https://api.deepseek.com"):
@@ -411,7 +571,9 @@ class VisionProvider:
             item.bbox.page = page
 
     def _call_with_repair(self, payload: dict) -> RawExtraction:
-        for attempt in range(3):
+        """调用并用格式修复重试；重试次数来自 config/vision.json 的 parse_gate.json_repair_attempts。"""
+        max_attempt = JSON_REPAIR_ATTEMPTS
+        for attempt in range(max_attempt + 1):
             try:
                 data = self._call(payload)
             except urllib.error.HTTPError as e:
@@ -439,8 +601,9 @@ class VisionProvider:
                     raise ValueError("缺少顶层字段: " + ", ".join(sorted(missing)))
                 return RawExtraction.model_validate(raw)
             except (json.JSONDecodeError, ValidationError, ValueError) as e:
-                if attempt == 2:
-                    raise ValueError(f"模型输出格式校验失败，已重试 2 次: {e}") from e
+                if attempt == max_attempt:
+                    raise ValueError(
+                        f"模型输出格式校验失败，已重试 {max_attempt} 次: {e}") from e
                 payload["messages"] = [
                     *payload["messages"],
                     {"role": "assistant", "content": raw_text[:1500]},
@@ -456,6 +619,10 @@ class VisionProvider:
         """针对用户在图纸上框选的局部区域，识别其中的元器件与回路分支。"""
         if not self.api_key:
             raise RuntimeError("VISION_API_KEY 未配置")
+        with self._log_lock:
+            self.last_call_logs = []
+            self.last_usage_summary = {}
+            self.api_call_attempts = 0
         prompt = (
             "你是资深电气施工图审图与预算工程师。用户在配电系统图中框选了一块局部区域，"
             "请仔细观察这张局部图中的所有电气图形、文字标注、说明和符号：\n"
@@ -494,7 +661,7 @@ class VisionProvider:
                 {"role": "system", "content": "你只输出合法 JSON，不添加 Markdown 块标签或多余解释。"},
                 {"role": "user", "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_data_url, "detail": "high"}},
+                    {"type": "image_url", "image_url": {"url": image_data_url, "detail": self.detail}},
                 ]},
             ],
             "response_format": {"type": "json_object"},
@@ -515,6 +682,7 @@ class VisionProvider:
                 raise RuntimeError(f"视觉解析调用失败(HTTP {e.code}): {body[:300]}") from e
 
         self._record_usage(data)
+        self._summarize_usage()
         raw_text = data["choices"][0]["message"]["content"]
         try:
             return json.loads(raw_text)

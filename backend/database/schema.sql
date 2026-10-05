@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_drawings_hash ON drawings(file_hash);
 
 
 -- 3. CAD 物理图元表与空间索引 (CAD Entities)
--- 用于毫秒级局部框选、文字-回路拓扑关联合成、OCR与CAD原文字体比对
+-- 为局部框选、文字-回路关联、OCR 与 CAD 原生文字比对提供持久化字段
 CREATE TABLE IF NOT EXISTS cad_entities (
     id BIGSERIAL PRIMARY KEY,
     drawing_id VARCHAR(36) NOT NULL REFERENCES drawings(id) ON DELETE CASCADE,

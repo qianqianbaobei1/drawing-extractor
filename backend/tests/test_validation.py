@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
+import test_support  # noqa: F401
 import pymupdf
 from fastapi import HTTPException
 from openpyxl import load_workbook
@@ -210,12 +211,34 @@ class PageAndTileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             pdf = _make_pdf(os.path.join(d, "a1.pdf"), 841, 594)
             tiles = render_tiles(pdf, 0)
-            self.assertEqual(len(tiles), 4)
+            # 块数由页面尺寸推导，不再写死 2x2；契约是「铺满整页 + 覆盖自检通过 + 起点回页内」。
+            from extractor.render import grid_for
+            cols, rows = grid_for(841, 594)
+            self.assertEqual(len(tiles), cols * rows)
+            self.assertTrue(tiles[0]["coverage"]["fully_covered"])
+            self.assertEqual(tiles[0]["coverage"]["clip_count"], cols * rows)
             for tile in tiles:
                 clip = tile["clip"]
-                self.assertGreater(clip["w"], 0.5)
+                # 每块至少覆盖自己那一格，且不越出页面
+                self.assertGreaterEqual(clip["w"], 1.0 / cols - 1e-9)
+                self.assertGreaterEqual(clip["h"], 1.0 / rows - 1e-9)
+                self.assertGreaterEqual(clip["x"], 0.0)
                 self.assertLessEqual(clip["x"] + clip["w"], 1.0 + 1e-9)
                 self.assertTrue(os.path.exists(tile["path"]))
+
+    def test_slice_grid_adapts_to_any_page_format(self):
+        """任何幅面都必须铺满、且每块长边不超过目标值——这是“所有图纸都能切准”的可验证口径。"""
+        from extractor.render import grid_for, plan_grid_clips, coverage_report, TILE_TARGET_LONG_MM
+        for width, height in [(297, 210), (420, 297), (594, 420), (841, 594),
+                              (1189, 841), (1600, 400), (300, 1200), (2500, 300)]:
+            cols, rows = grid_for(width, height)
+            clips = plan_grid_clips(cols, rows)
+            report = coverage_report(clips)
+            self.assertTrue(report["fully_covered"], f"{width}x{height} 出现漏区: {report}")
+            self.assertAlmostEqual(report["covered_area_ratio"], 1.0, places=6)
+            # 加长图会撞到网格上限，因此只对未触顶的幅面断言块长边
+            if cols < 4 and rows < 4:
+                self.assertLessEqual(max(width / cols, height / rows), TILE_TARGET_LONG_MM + 1e-6)
 
     def test_tile_coordinates_map_back_to_the_page(self):
         """块内坐标折回整页后必须落在该块自己的范围内 —— 否则高亮会漂到别的区域。"""
@@ -977,17 +1000,20 @@ class AiCostAndSheetCatalogTests(unittest.TestCase):
 
     def test_estimate_cost_rates(self):
         from extractor.vision import estimate_cost
-        # DeepSeek: in 1.0/M, out 2.0/M
-        res_ds = estimate_cost("deepseek-chat", 1_000_000, 1_000_000)
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        # Use a fixed off-peak instant so the regression assertion is independent of test runtime.
+        now = datetime(2026, 9, 7, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        res_ds = estimate_cost("deepseek-flash", 1_000_000, 1_000_000, now=now)
         self.assertAlmostEqual(res_ds["cost_in"], 1.0, places=4)
-        self.assertAlmostEqual(res_ds["cost_out"], 2.0, places=4)
-        self.assertAlmostEqual(res_ds["total_cost"], 3.0, places=4)
+        self.assertAlmostEqual(res_ds["cost_out"], 4.0, places=4)
+        self.assertAlmostEqual(res_ds["total_cost"], 5.0, places=4)
 
-        # GPT-4o-mini
-        res_mini = estimate_cost("gpt-4o-mini", 100_000, 50_000)
-        self.assertAlmostEqual(res_mini["cost_in"], 0.11, places=4)
-        self.assertAlmostEqual(res_mini["cost_out"], 0.22, places=4)
-        self.assertAlmostEqual(res_mini["total_cost"], 0.33, places=4)
+        # No source-backed rate card exists for these identifiers; amount must stay unknown.
+        res_unknown = estimate_cost("gpt-4o-mini", 100_000, 50_000, now=now)
+        self.assertFalse(res_unknown["pricing_available"])
+        self.assertEqual(res_unknown["pricing_status"], "unknown_model_rate")
+        self.assertEqual(res_unknown["total_cost"], 0.0)
 
     def test_project_ai_usage_recording_and_query(self):
         import store
@@ -1071,4 +1097,3 @@ class AiCostAndSheetCatalogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

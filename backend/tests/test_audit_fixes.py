@@ -1,5 +1,6 @@
 import os
 import unittest
+import test_support  # noqa: F401
 from fastapi.testclient import TestClient
 from app import app, jobs, WORKDIR
 import db
@@ -186,6 +187,60 @@ class TestAuditFixes(unittest.TestCase):
                 conn.execute("DELETE FROM jobs WHERE id = ?", (victim_job_id,))
             if victim_job_id in jobs:
                 del jobs[victim_job_id]
+
+    def test_ai_usage_saved_and_restored_from_db(self):
+        """测试 5：AI Token 消耗量与计费审计落盘——服务重启后 ai_usage 不丢失。"""
+        job_id = "test_ai_usage_restore_job"
+        test_usage = {
+            "model": "deepseek-flash",
+            "calls_count": 2,
+            "prompt_tokens": 1200,
+            "prompt_cache_hit_tokens": 800,
+            "prompt_cache_miss_tokens": 400,
+            "completion_tokens": 300,
+            "total_tokens": 1500,
+            "cost_in": 0.00056,
+            "cost_out": 0.00060,
+            "total_cost": 0.00116,
+            "currency": "￥",
+            "logs": []
+        }
+        db.db_save_job({
+            "job_id": job_id,
+            "tenant_id": "default",
+            "status": "done",
+            "filename": "测试图纸.pdf",
+            "ai_usage": test_usage,
+            "summary": {"title": "测试图纸", "boxes": 1, "circuits": 0, "components": 0}
+        })
+
+        try:
+            loaded = db.db_get_job(job_id)
+            self.assertIsNotNone(loaded)
+            self.assertIn("ai_usage", loaded)
+            self.assertEqual(loaded["ai_usage"].get("total_tokens"), 1500)
+            self.assertEqual(loaded["ai_usage"].get("prompt_cache_hit_tokens"), 800)
+            self.assertAlmostEqual(loaded["ai_usage"].get("total_cost"), 0.00116, places=4)
+        finally:
+            conn = db._get_conn()
+            with conn:
+                conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+
+    def test_estimate_cost_deepseek_cache_hits(self):
+        """测试 6：按价格表来源与生效日，对 DeepSeek 缓存分段计费。"""
+        from extractor.vision import estimate_cost
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        # 2026-09-07 周一 08:00 上海时间，非高峰：命中 ¥0.02/M、未命中 ¥1/M、输出 ¥4/M。
+        now = datetime(2026, 9, 7, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        res = estimate_cost("deepseek-flash", 1000, 500,
+                            prompt_cache_hit_tokens=800, prompt_cache_miss_tokens=200,
+                            now=now)
+        self.assertAlmostEqual(res["cost_in"], 0.000216, places=8)
+        self.assertAlmostEqual(res["cost_out"], 0.002, places=8)
+        self.assertAlmostEqual(res["total_cost"], 0.002216, places=8)
+        self.assertEqual(res["pricing_period"], "off_peak")
+        self.assertTrue(res["pricing_available"])
 
 
 if __name__ == "__main__":

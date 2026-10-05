@@ -1,0 +1,250 @@
+{
+  "_comment": "交付口径。Excel 样式、表名、列宽、默认平替品牌与文案。",
+  "_env": {
+    "DEFAULT_TARGET_BRAND": "brand.default_target",
+    "EXCEL_TEMPLATE_PATH": "template.path"
+  },
+  "brand": {
+    "default_target": "正泰",
+    "unknown": "通用/国标",
+    "label": "平替品牌"
+  },
+  "template": {
+    "path": ""
+  },
+  "fonts": {
+    "family": "微软雅黑",
+    "latin": "Arial"
+  },
+  "palette": {
+    "header_fill": "4472C4",
+    "header_text": "FFFFFF",
+    "summary_header_fill": "D9D9D9",
+    "summary_header_text": "000000",
+    "category_fill": "E2EFDA",
+    "category_text": "274E13",
+    "card_header_fill": "2F5597",
+    "card_sub_fill": "DDEBF7",
+    "total_fill": "F2F2F2",
+    "box_header_fill": "D9EDF7",
+    "box_header_text": "000000",
+    "orange_fill": "FCE4D6",
+    "orange_text": "000000",
+    "sub_text": "404040",
+    "meta_text": "000000",
+    "dark_bold_text": "1F497D",
+    "link_text": "0563C1",
+    "cover_company_text": "333333",
+    "cover_en_text": "7F7F7F",
+    "border_light": "BFBFBF",
+    "border_dark": "595959",
+    "card_alt_fill": "F7F7F7",
+    "label_fill": "F2F5F9",
+    "value_fill": "FAFAFA",
+    "saving_text": "137333",
+    "warning_text": "C5221F",
+    "cabinet_fill": "EBF1F5"
+  },
+  "sheets": {
+    "cover": "封面",
+    "summary": "屏柜汇总表",
+    "detail": "屏柜分项表",
+    "box_cards": "箱体分项明细",
+    "boxes": "箱体清单",
+    "components": "元器件汇总",
+    "circuits": "回路明细",
+    "requirements": "技术要求与报价说明",
+    "changes": "变更记录",
+    "topology_suffix": "配电拓扑架构树",
+    "reconciliation": "图纸目录对账",
+    "replacements_prefix": "集中采购平替",
+    "bom": "全项目采购总清单(BOM)",
+    "ledger": "配电箱成套设备台账",
+    "aux_estimate": "成套辅材与制造估算",
+    "project_requirements": "全项目统一技术要求",
+    "unresolved": "全项目待核对项"
+  },
+  "columns": {
+    "box_cards": [
+      6,
+      14,
+      24,
+      16,
+      26,
+      14,
+      12,
+      10,
+      32,
+      24
+    ],
+    "cover": [
+      8,
+      16,
+      26,
+      20,
+      16,
+      20,
+      16,
+      14,
+      16
+    ],
+    "cover_legacy": [
+      10,
+      16,
+      26,
+      20,
+      8,
+      10,
+      16,
+      18,
+      24
+    ],
+    "boxes": [
+      6,
+      14,
+      20,
+      10,
+      22,
+      18,
+      24,
+      10,
+      36
+    ],
+    "components": [
+      6,
+      26,
+      32,
+      8,
+      10,
+      32,
+      36
+    ],
+    "circuits": [
+      6,
+      12,
+      8,
+      26,
+      12,
+      14,
+      12,
+      14,
+      12,
+      34,
+      10,
+      22,
+      30,
+      14,
+      30
+    ],
+    "requirements": [
+      6,
+      24,
+      110
+    ],
+    "detail": [
+      6,
+      38,
+      12,
+      14,
+      24,
+      14,
+      12,
+      12,
+      10,
+      16,
+      28
+    ],
+    "reconciliation": [
+      6,
+      16,
+      28,
+      30,
+      30,
+      30,
+      16
+    ],
+    "bom": [
+      6,
+      26,
+      32,
+      8,
+      14,
+      42,
+      14,
+      14,
+      24
+    ],
+    "ledger": [
+      6,
+      16,
+      20,
+      12,
+      18,
+      18,
+      22,
+      10,
+      10,
+      24
+    ],
+    "aux_estimate": [
+      6,
+      16,
+      10,
+      24,
+      18,
+      20,
+      18,
+      20,
+      10,
+      16
+    ],
+    "project_requirements": [
+      6,
+      26,
+      90
+    ],
+    "unresolved": [
+      6,
+      26,
+      28,
+      70,
+      12,
+      12
+    ]
+  },
+  "labels": {
+    "base_title": "配电箱元器件清单(报价用)",
+    "default_summary_title": "配电箱元器件清单(报价用)",
+    "as_written": "图纸写法无法安全拆分，按原文计入，数量待人工确认",
+    "no_spec": "(规格未标注)",
+    "export_filename": "配电箱元器件清单(报价用)",
+    "quotation_title": "成套电气设备工程报价书",
+    "quotation_title_en": "COMPLETE LOW-VOLTAGE ELECTRICAL EQUIPMENT QUOTATION",
+    "detail_card_suffix": "成套箱体分项卡片明细表"
+  },
+  "export_gate": {
+    "_comment": "交付门禁。默认 false = 任何时候都能直接导出，未确认的存疑项会如实写进 Excel 的待核对区，不遮挡交付。若某个项目要求“存疑未清零不许导出”，把 block_unresolved_default 改成 true，届时仍可用 force=true 单次放行。",
+    "block_unresolved_default": false,
+    "blocking_severities": [
+      "ERROR",
+      "WARNING"
+    ],
+    "force_requires_explicit": true
+  },
+  "estimation": {
+    "_comment": "交付用的工程估算系数（成套辅料/外壳/工时/兜底单价）。这些是经验值不是供应商报价，只用于量级参考。",
+    "summary_unit_price_fallback": 1500.0,
+    "enclosure_base_surface": 280.0,
+    "enclosure_base_floor": 320.0,
+    "accessory_per_circuit": 35.0,
+    "labor_per_circuit": 25.0,
+    "labor_fixed": 80.0,
+    "labor_incoming_fixed": 120.0,
+    "labor_per_extra_circuit": 35.0,
+    "default_device_unit": "只",
+    "default_box_unit": "台",
+    "default_assembly_unit": "套",
+    "unnamed_device_fallback": "监控模块",
+    "unnamed_box_fallback": "配电箱"
+  }
+}

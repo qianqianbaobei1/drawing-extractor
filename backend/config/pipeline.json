@@ -1,0 +1,155 @@
+{
+  "_comment": "可标定阈值。切片分辨率、CAD 几何判据、准入门禁都在这里，现场可按设计院习惯调整。",
+  "_env": {
+    "OVERVIEW_LONG_EDGE": "render.overview_long_edge",
+    "MIN_LINE_WIDTH_PX": "render.min_line_width_px",
+    "TILE_TRIGGER_MM": "render.tile_trigger_mm",
+    "TILE_DENSE_DRAWINGS": "render.tile_dense_drawings",
+    "TILE_DENSE_ITEMS": "render.tile_dense_items",
+    "TILE_OVERLAP": "render.tile_overlap",
+    "TILE_TARGET_LONG_MM": "render.tile_target_long_mm",
+    "TILE_MAX_COLS": "render.tile_max_cols",
+    "TILE_MAX_ROWS": "render.tile_max_rows",
+    "MAX_TEXT_ENTITIES_LIMIT": "cad.max_text_entities_limit",
+    "CAD_BREAKER_FILL_RATE_MIN": "gates.cad_breaker_fill_rate_min",
+    "TILE_TARGET_LONG_MM_DENSE": "render.tile_target_long_mm_dense",
+    "CAD_INCOMING_PHASE_DEFAULT": "cad.incoming_phase_default"
+  },
+  "render": {
+    "overview_long_edge": 2400,
+    "min_dpi": 72,
+    "max_dpi": 400,
+    "tile_trigger_mm": 320,
+    "tile_dense_drawings": 30,
+    "tile_dense_items": 10000,
+    "tile_overlap": 0.12,
+    "tile_target_long_mm": 300.0,
+    "tile_max_cols": 4,
+    "tile_max_rows": 4,
+    "mm_per_inch": 25.4,
+    "min_line_width_px": 1.5,
+    "coverage_tolerance": 0.001,
+    "unit_page_target_mm": 297.0,
+    "tile_target_long_mm_dense": 220.0
+  },
+  "cad": {
+    "max_text_entities_limit": 25000,
+    "frame_min_dim": 30000.0,
+    "frame_min_side": 15000.0,
+    "frame_max_aspect": 2.8,
+    "frame_dedup_tol": 0.02,
+    "frame_dup_tol": 10.0,
+    "unit_rect_min_w": 3500.0,
+    "unit_rect_max_w": 48000.0,
+    "unit_rect_min_h": 3000.0,
+    "unit_rect_max_h": 52000.0,
+    "unit_rect_dedup_tol": 200.0,
+    "rect_aspect_min": 1.05,
+    "rect_aspect_max": 2.4,
+    "polyline_close_tol": 100.0,
+    "box_above_min": 2000.0,
+    "box_above_max": 7000.0,
+    "box_x_tolerance": 5000.0,
+    "crop_pad_side": 500.0,
+    "crop_pad_top": 600.0,
+    "crop_pad_bottom": 2600.0,
+    "page_long_mm_min": 240.0,
+    "page_long_mm_max": 1600.0,
+    "unit_page_long_mm": 297.0,
+    "grid_cell": 40000.0,
+    "text_row_bucket": 2000.0,
+    "text_row_align_tol": 4000.0,
+    "title_text_min_height": 300.0,
+    "sheet_default_width": 118900.0,
+    "sheet_width_mm_basis": 1189.0,
+    "sheet_aspect_ratio": 1.414,
+    "sheet_scale_text_height": 15.0,
+    "sheet_scale_reference_height": 3.5,
+    "cell_size": 35000.0,
+    "block_plan_min_w": 1000.0,
+    "block_plan_min_h": 600.0,
+    "block_plan_aspect_min": 1.2,
+    "block_plan_aspect_max": 1.8,
+    "iso_landscape_sizes": [
+      [
+        1189.0,
+        841.0
+      ],
+      [
+        841.0,
+        594.0
+      ],
+      [
+        594.0,
+        420.0
+      ],
+      [
+        420.0,
+        297.0
+      ],
+      [
+        297.0,
+        210.0
+      ]
+    ],
+    "dwg2dxf_search_paths": [
+      "/opt/homebrew/bin/dwg2dxf",
+      "/usr/local/bin/dwg2dxf",
+      "/usr/bin/dwg2dxf"
+    ],
+    "dwg2svg_search_paths": [
+      "/opt/homebrew/bin/dwg2SVG"
+    ],
+    "convert_timeout_s": 900,
+    "render_fallback_page": [
+      1190,
+      842
+    ],
+    "sheet_width_gap_min": 80000.0,
+    "fallback_text_height": 100.0,
+    "unit_caption_default_height": 10.0,
+    "block_text_default_height": 20.0,
+    "crop_overlap_ratio": 0.25,
+    "crop_width_factor": 1.6,
+    "crop_height_ratio": 0.25,
+    "crop_top_max_pad": 6000.0,
+    "crop_caption_gap": 250.0,
+    "crop_caption_gap_alt": 300.0,
+    "crop_bottom_gap": 800.0,
+    "crop_below_pad": 100.0,
+    "incoming_phase_default": "",
+    "incoming_phase_assumption_note": "按图纸惯例进线为三相五线制（L1/L2/L3/N/PE）；图上未逐字标注相序，已按规则假定",
+    "circuit_box_max_dx": 35000.0,
+    "circuit_box_max_dy": 45000.0,
+    "circuit_row_tolerance_ratio": 1.833,
+    "circuit_row_tolerance_height_basis": 300.0,
+    "circuit_scale_basis_height": 300.0,
+    "circuit_pad_x": 8000.0,
+    "circuit_pad_y": 3000.0,
+    "circuit_def_window_x": 12000.0,
+    "circuit_def_window_y_down": 18000.0,
+    "circuit_def_window_y_up": 6000.0,
+    "circuit_pad_x_height_ratio": 60.0,
+    "circuit_pad_y_height_ratio": 15.0,
+    "circuit_def_window_x_height_ratio": 80.0,
+    "circuit_def_window_y_down_height_ratio": 80.0,
+    "circuit_def_window_y_up_height_ratio": 30.0
+  },
+  "gates": {
+    "_comment": "原生 CAD 提取结果进入流水线的准入条件；不达标即回退视觉大模型。",
+    "cad_breaker_fill_rate_min": 0.5,
+    "cad_min_boxes": 1,
+    "cad_min_circuits": 1
+  },
+  "evidence": {
+    "_comment": "证据来源权重。物理事实字段只接受独立于模型自述的证据（CAD 原生矢量文字 / PDF 内嵌文字层 / OCR / 人工），模型自述只能到 PARSED_OK。",
+    "physical_fact_origins": [
+      "cad_native",
+      "pdf_text",
+      "ocr",
+      "human"
+    ],
+    "model_origin": "model_vision",
+    "allow_confirmed_without_physical": false
+  }
+}

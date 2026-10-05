@@ -27,6 +27,8 @@ const S = {
   rec: null,
   settings: {},
   queue: [],
+  currentProject: '',   // 当前进入的项目名；上传/总BOM/拓扑都以它为准
+  projectInfo: null,    // /api/projects/{name} 的返回，供项目工作区渲染
 };
 
 const $ = id => document.getElementById(id);
@@ -374,22 +376,248 @@ const putJSON = (path, body) => api(path, {
 
 /* ===================== 路由 ===================== */
 
+/** 把当前位置写进地址栏 hash：刷新/分享链接能回到同一个项目或图纸。 */
+function syncHash(page) {
+  const enc = encodeURIComponent;
+  let hash = '';
+  if (page === 'project' && S.currentProject) hash = `#/project/${enc(S.currentProject)}`;
+  else if (page === 'workbench' && S.jobId) hash = `#/job/${enc(S.jobId)}`;
+  else if (page && page !== 'projects') hash = `#/${page}`;
+  if (location.hash !== hash) history.replaceState(null, '', hash || location.pathname);
+}
+
+/** 启动/刷新时按 hash 恢复位置；解析不了就停在项目列表。 */
+async function applyHashRoute() {
+  const raw = (location.hash || '').replace(/^#\/?/, '');
+  const [kind, ...rest] = raw.split('/');
+  const value = decodeURIComponent(rest.join('/') || '');
+  if (kind === 'project' && value) { await openProject(value); return true; }
+  if (kind === 'job' && value) { await openJob(value); return true; }
+  if (kind === 'history' || kind === 'settings') { navGo(kind); return true; }
+  return false;
+}
+
 function navGo(page) {
   const sc = $('startscreen');
   if (sc) sc.hidden = true;
   S.route = page;
+  syncHash(page);
   document.querySelectorAll('.page').forEach(m => { m.hidden = m.id !== 'page-' + page; });
   document.querySelectorAll('.nav button').forEach(b => b.classList.toggle('active', b.dataset.p === page));
   if (page === 'projects') loadProjects();
+  if (page === 'project') renderProjectPage();
   if (page === 'history') loadHistory();
   if (page === 'settings') loadSettings();
-  if (page === 'upload') renderQueue();
+  if (page === 'upload') { renderQueue(); renderUploadTarget(); }
   if (page === 'workbench') {
     if (S.jobId) renderWorkbench();
   }
 }
 
-/* ===================== 项目页 ===================== */
+/* ===================== 项目工作区 ===================== */
+
+function currentProjectName() { return S.currentProject || ''; }
+
+/** 进入项目：所有后续操作（上传/总BOM/拓扑/导出）都挂在这个项目上。 */
+async function openProject(name) {
+  if (!name) return;
+  S.currentProject = name;
+  navGo('project');
+  syncHash('project');
+}
+
+async function refreshCurrentProject() {
+  if (!S.currentProject) { S.projectInfo = null; return null; }
+  try {
+    const { project } = await api(`/api/projects/${encodeURIComponent(S.currentProject)}`);
+    S.projectInfo = project;
+    return project;
+  } catch (e) {
+    // 项目被改名/合并后旧名字会 404，回到列表避免停在空页
+    toast('项目已不存在：' + e.message);
+    S.currentProject = '';
+    S.projectInfo = null;
+    navGo('projects');
+    return null;
+  }
+}
+
+const PJ_STATUS = {
+  active: ['进行中', 'info'], archived: ['已归档', ''], bidding: ['投标中', 'warn'], won: ['已中标', 'ok'],
+};
+
+function pjStatusPill(status) {
+  const [label, cls] = PJ_STATUS[status] || [status || '进行中', ''];
+  return `<span class="pill ${cls}">${esc(label)}</span>`;
+}
+
+/** 上传图纸入口：没选项目时先把归属说清楚，不要默默传进“未分组”。 */
+function startUploadFlow() {
+  if (S.currentProject) { navGo('upload'); return; }
+  navGo('upload');
+}
+
+function uploadToCurrentProject() {
+  if (!S.currentProject) { toast('先进入一个项目'); return; }
+  navGo('upload');
+}
+
+function backFromUpload() {
+  if (S.currentProject) navGo('project');
+  else navGo('projects');
+}
+
+/** 上传页顶部：把“这张图会进哪个项目”写清楚。 */
+function renderUploadTarget() {
+  const box = $('up-target');
+  if (!box) return;
+  const sel = $('uploadProject');
+  const picked = sel ? sel.value : '';
+  if (picked) {
+    box.innerHTML = `<b>图纸将归入项目：</b>${esc(picked)}` +
+      `　<button class="linklike" onclick="openProject(decodeURIComponent('${safeJsArg(picked)}'))">进入项目 →</button>`;
+    return;
+  }
+  if (S.currentProject) {
+    box.innerHTML = `<b>图纸将归入项目：</b>${esc(S.currentProject)}（当前项目）`;
+    return;
+  }
+  box.innerHTML = '<b>归属：</b>未指定项目——上传后程序会先从图纸图签里找「工程名称」并自动建项目；' +
+    '找不到就用文件名暂存，进入项目后可随时重命名。也可在上方下拉里直接选已有项目。';
+}
+
+function pjBom() {
+  if (S.currentProject) viewProjectBom(S.currentProject);
+}
+
+function pjTopology() {
+  if (S.currentProject) viewProjectTopology(S.currentProject);
+}
+
+async function renderProjectPage() {
+  if (!S.currentProject) { navGo('projects'); return; }
+  const p = await refreshCurrentProject();
+  if (!p) return;
+
+  $('pj-name').textContent = p.name;
+  const srcTag = p.name_source === 'filename'
+    ? '<span class="pill warn" title="图纸图签里没读到工程名称，暂用文件名代替">项目名待核对</span>'
+    : (p.name_source === 'drawing'
+        ? '<span class="pill info" title="项目名来自图纸图签中的工程名称">名称来自图纸图签</span>'
+        : (p.name_source === 'manual' ? '<span class="pill">人工命名</span>' : ''));
+  $('pj-namesrc').innerHTML = srcTag;
+  $('pj-export').href = `/api/projects/${encodeURIComponent(p.name)}/export_bom`;
+
+  const info = (p.jobs || []).map(j => (j.summary || {}).project_info).find(x => x && x.found) || {};
+  const evidence = (info.evidence || []).length
+    ? `<span class="mut" style="font-size:11.5px;font-weight:400">识别依据：${esc(info.evidence.join('；'))}</span>`
+    : '';
+  $('pj-infosrc').innerHTML = evidence || '<span class="mut" style="font-weight:400;font-size:11.5px">未从图纸读到图签信息，可手动填写</span>';
+
+  const fields = [
+    ['project_code', '工程编号'], ['client_name', '建设单位'],
+    ['designer_institute', '设计单位'], ['location', '建设地点'],
+  ];
+  $('pj-info').innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px 18px">
+    ${fields.map(([key, label]) => `<label style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mut)">
+      ${label}
+      <input id="pjf-${key}" data-field="${key}" value="${esc(p[key] || '')}" placeholder="未填写"
+             style="border:1px solid var(--line2);padding:6px 8px;font:inherit;font-size:13px;background:#fff;color:var(--txt)">
+    </label>`).join('')}
+    <label style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mut)">状态
+      <select id="pjf-status" data-field="status" style="border:1px solid var(--line2);padding:6px 8px;font:inherit;font-size:13px;background:#fff">
+        ${Object.keys(PJ_STATUS).map(k => `<option value="${k}"${(p.status || 'active') === k ? ' selected' : ''}>${PJ_STATUS[k][0]}</option>`).join('')}
+      </select>
+    </label>
+    <label style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mut)">备注
+      <input id="pjf-note" data-field="note" value="${esc(p.note || '')}" placeholder="未填写"
+             style="border:1px solid var(--line2);padding:6px 8px;font:inherit;font-size:13px;background:#fff;color:var(--txt)">
+    </label>
+  </div>
+  <div style="margin-top:12px;display:flex;align-items:center;gap:10px">
+    <button class="btn primary sm" onclick="saveProjectInfo()">保存项目信息</button>
+    <span class="mut" style="font-size:11.5px">仅保存本项目的工程档案，不影响图纸数据</span>
+  </div>`;
+
+  const t = p.totals || {};
+  const stat = (label, value, note) => `<div style="display:flex;flex-direction:column;gap:2px;min-width:96px">
+    <span class="mut" style="font-size:11.5px">${label}</span>
+    <span style="font-size:20px;font-weight:700;font-family:ui-monospace,monospace">${value}</span>
+    ${note ? `<span class="mut" style="font-size:11px">${note}</span>` : ''}</div>`;
+  $('pj-stats').innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:26px;align-items:flex-end">
+    ${stat('图纸', t.drawings || 0)}
+    ${stat('已提取', `${t.done || 0}/${t.drawings || 0}`)}
+    ${stat('箱体', t.boxes || 0)}
+    ${stat('回路', t.circuits || 0)}
+    ${stat('元器件', t.components || 0)}
+    ${stat('待核对', t.unresolved || 0, t.unresolved ? '导出前需确认' : '全部已确认')}
+    ${stat('AI 费用', '￥' + (p.ai_cost_total || 0).toFixed(4), (p.ai_tokens_total || 0).toLocaleString() + ' tok')}
+    <div style="margin-left:auto">${pjStatusPill(p.status || 'active')}</div>
+  </div>`;
+
+  const jobs = p.jobs || [];
+  $('pj-dwgcount').textContent = jobs.length ? `（${jobs.length} 份）` : '';
+  $('pj-dwgempty').hidden = jobs.length > 0;
+  $('pj-dwgrows').innerHTML = jobs.map(j => {
+    const s = j.summary || {};
+    const st = j.status === 'done' ? '<span class="pill ok">已提取</span>'
+      : (j.status === 'failed' ? '<span class="pill bad">提取失败</span>'
+        : `<span class="pill info">${esc(j.status || '处理中')}</span>`);
+    const ext = (j.filename || '').split('.').pop().toUpperCase();
+    const note = j.project_note ? `<span class="sub">${esc(j.project_note)}</span>` : '';
+    const err = j.error ? `<span class="sub" style="color:var(--bad)">${esc(j.error)}</span>` : '';
+    return `<tr>
+      <td><span class="pill" style="font-size:10px;margin-right:6px">${esc(ext)}</span><b>${esc(j.filename || j.job_id)}</b>${note}${err}</td>
+      <td>${j.pages || 1}</td>
+      <td>${s.boxes ?? 0}</td>
+      <td>${s.circuits ?? 0}</td>
+      <td>${s.components ?? 0}</td>
+      <td>${(s.uncertainties || []).filter(u => !u.resolved).length
+            ? `<span class="pill warn">${(s.uncertainties || []).filter(u => !u.resolved).length}</span>`
+            : '<span class="pill">0</span>'}</td>
+      <td>${st}</td>
+      <td class="mono" style="font-size:11px">${esc(String(j.created_at || '').replace('T', ' ').slice(0, 16) || '—')}</td>
+      <td>
+        ${j.status === 'done' ? `<button class="linklike" onclick="openJob('${j.job_id}')">进入工作台</button>`
+          : '<span class="mut">—</span>'}
+        <span style="color:var(--line2);margin:0 5px">|</span>
+        <button class="linklike" onclick="reparseJob('${j.job_id}')">重新解析</button>
+        <span style="color:var(--line2);margin:0 5px">|</span>
+        <button class="linklike" onclick="openBatchProjectModal('${j.job_id}')">移到其他项目</button>
+      </td></tr>`;
+  }).join('');
+}
+
+async function saveProjectInfo() {
+  if (!S.currentProject) return;
+  const body = {};
+  document.querySelectorAll('#pj-info [data-field]').forEach(el => { body[el.dataset.field] = el.value.trim(); });
+  try {
+    await api(`/api/projects/${encodeURIComponent(S.currentProject)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    toast('项目信息已保存');
+    renderProjectPage();
+  } catch (e) { toast('保存失败：' + e.message); }
+}
+
+async function renameCurrentProject() {
+  if (!S.currentProject) return;
+  const next = prompt('项目名称（图纸归属与费用账单会一起改名）', S.currentProject);
+  const name = (next || '').trim();
+  if (!name || name === S.currentProject) return;
+  try {
+    await api(`/api/projects/${encodeURIComponent(S.currentProject)}/rename`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_name: name }),
+    });
+    S.currentProject = name;
+    S.projectInfo = null;
+    toast('已重命名为「' + name + '」');
+    renderProjectPage();
+  } catch (e) { toast('重命名失败：' + e.message); }
+}
+
+/* ===================== 项目列表页 ===================== */
 
 async function loadProjects() {
   const { projects } = await api('/api/projects');
@@ -397,7 +625,6 @@ async function loadProjects() {
   projects.forEach((p, idx) => {
     const jobs = p.jobs || [];
     const t = p.totals;
-    const ready = jobs.find(j => j.status === 'done');
     const names = jobs.map(j => j.filename).join(' / ');
     const sub = jobs.length
       ? `${jobs.length} 份图纸${jobs.length <= 3 ? ' · ' + esc(names) : ''}`
@@ -416,30 +643,20 @@ async function loadProjects() {
       <button class="linklike" style="padding:1px 5px;font-size:11px" onclick="event.stopPropagation();openProjectAiLogs(decodeURIComponent('${safeJsArg(p.name)}'))">账单</button>
     </div>`;
 
-    const failedJob = jobs.find(j => j.status === 'failed');
-    const retryBtn = failedJob
-      ? `<span style="color:var(--line2);margin:0 3px">|</span><button class="linklike" style="color:var(--err)" onclick="event.stopPropagation();reparseJob('${failedJob.job_id}')" title="使用最新算法重试失败的图纸">重试</button>`
-      : '';
-    const action = ready
-      ? `<button class="linklike" onclick="event.stopPropagation();toggleProjectDrawer(${idx})">图纸列表(${jobs.length})</button>
-         <span style="color:var(--line2);margin:0 3px">|</span>
-         <button class="linklike" onclick="event.stopPropagation();viewProjectBom(decodeURIComponent('${safeJsArg(p.name)}'))">总BOM</button>
-         <span style="color:var(--line2);margin:0 3px">|</span>
-         <button class="linklike" onclick="event.stopPropagation();viewProjectTopology(decodeURIComponent('${safeJsArg(p.name)}'))">供电拓扑</button>
-         <span style="color:var(--line2);margin:0 3px">|</span>
-         <a class="linklike" href="/api/projects/${encodeURIComponent(p.name)}/export_bom" onclick="event.stopPropagation()" download>导出采购表</a>${retryBtn}`
-      : (failedJob
-          ? `<button class="linklike" style="color:var(--err)" onclick="event.stopPropagation();reparseJob('${failedJob.job_id}')">重试提取</button>`
-          : `<button class="linklike" onclick="event.stopPropagation();navGo('upload')">上传</button>`);
-    
+    // 主操作是「进入项目」：进入后上传、看图纸、总BOM、拓扑、导出都在项目工作区里
+    const action = `<button class="btn primary sm" onclick="event.stopPropagation();openProject(decodeURIComponent('${safeJsArg(p.name)}'))">进入项目 →</button>
+      ${jobs.length ? `<button class="linklike" style="margin-left:10px" onclick="event.stopPropagation();toggleProjectDrawer(${idx})">快速预览</button>` : ''}`;
+    const nameBadge = p.name_source === 'filename'
+      ? ' <span class="pill warn" title="图纸图签里没读到工程名称，项目名暂取自文件名">待核对</span>' : '';
     const hasJobs = jobs.length > 0;
-    const arrow = hasJobs ? `<span id="proj-arrow-${idx}" style="display:inline-block;width:14px;cursor:pointer;color:var(--mut);transition:transform 0.15s">▶</span> ` : '';
-    rows.push(`<tr class="${hasJobs ? 'clickable' : ''}" onclick="toggleProjectDrawer(${idx})">
-      <td>${arrow}<b>${esc(p.name)}</b><span class="sub">${sub}</span></td>
+    const arrow = hasJobs ? `<span id="proj-arrow-${idx}" style="display:none;width:0">▶</span>` : '';
+    rows.push(`<tr class="clickable" onclick="openProject(decodeURIComponent('${safeJsArg(p.name)}'))">
+      <td>${arrow}<b>${esc(p.name)}</b>${nameBadge}<span class="sub">${sub}</span></td>
+      <td>${esc(p.client_name || '—')}</td>
       <td>${jobs.length}</td>
       <td>${t.boxes}</td>
       <td>${t.circuits}</td>
-      <td>${costCell}</td>
+      <td onclick="event.stopPropagation()">${costCell}</td>
       <td>${t.unresolved ? `<span class="pill warn">${t.unresolved}</span>` : '<span class="pill">0</span>'}</td>
       <td>${state}</td>
       <td class="mono" style="font-size:11px">${esc((p.updated_at || '').replace('T', ' ').slice(0, 16) || '—')}</td>
@@ -472,7 +689,7 @@ async function loadProjects() {
       }).join('');
 
       rows.push(`<tr id="proj-drawer-${idx}" style="display:none;background:#f8f9fc">
-        <td colspan="9" style="padding:10px 16px 14px 28px;border-top:none">
+        <td colspan="10" style="padding:10px 16px 14px 28px;border-top:none">
           <div style="font-size:11.5px;font-weight:600;color:var(--mut);margin-bottom:6px">📂 该工程所辖图纸清单 (${jobs.length} 份)：</div>
           <table class="grid sm" style="width:100%;margin:0;background:#fff;border:1px solid var(--line2)">
             <thead>
@@ -562,6 +779,11 @@ async function openProjectAiLogs(projectName) {
   }
 }
 
+function openJobAiUsage() {
+  const pName = S.job?.project || '未分组';
+  openProjectAiLogs(pName);
+}
+
 function closeAiLogs() {
   const modal = $('modalAiLog');
   if (modal) {
@@ -585,7 +807,17 @@ async function viewProjectBom(projectName, mode) {
   mode = currentBomMode || 'raw';
 
   const select = $('projBomModeSelect');
-  if (select && select.value !== mode) select.value = mode;
+  if (select) {
+    // 平替品牌选项由后端配置驱动；已存在的选项不重建，避免打断用户当前选择
+    const brands = brandOptions();
+    if (brands.length && select.options.length !== brands.length + 1) {
+      const keep = select.value;
+      select.innerHTML = '<option value="raw">原设计采购清单</option>'
+        + brands.map(b => `<option value="${esc(b)}">${esc(b)}一键平替方案</option>`).join('');
+      if (keep) select.value = keep;
+    }
+    if (select.value !== mode) select.value = mode;
+  }
 
   try {
     $('projBomTitle').textContent = `全项目采购总清单 (BOM) · ${projectName}`;
@@ -704,12 +936,18 @@ function closeProjBom() {
 }
 
 async function newProject() {
-  const name = prompt('项目名称，例如：万达广场 · 强电');
+  const name = prompt('新建项目\n项目名称（上传图纸时也会按图签工程名称自动建项目）', '');
   if (!name || !name.trim()) return;
-  await postJSON('/api/projects', { name: name.trim() });
-  toast('已新建项目：' + name.trim());
-  loadProjects();
-  fillProjectSelect();
+  const clean = name.trim();
+  try {
+    await postJSON('/api/projects', { name: clean });
+  } catch (e) {
+    toast('新建失败：' + e.message);
+    return;
+  }
+  toast('已新建项目：' + clean);
+  // 建完直接进入，符合"建完选一个项目进去上传图纸"的操作顺序
+  await openProject(clean);
 }
 
 function toggleProjectDrawer(idx) {
@@ -837,6 +1075,10 @@ async function openBatchProjectModal(preSelectedJobId) {
     sel.innerHTML = '<option value="">-- 选择已有项目 --</option>' +
       projects.filter(p => p.name !== '未分组').map(p => `<option value="${esc(p.name)}">${esc(p.name)} (${p.totals?.drawings || 0} 份图纸)</option>`).join('');
     $('batchNewProject').value = '';
+    // 从项目工作区点「归入图纸」进来的，目标默认就是这个项目
+    if (!preSelectedJobId && S.currentProject && [...sel.options].some(o => o.value === S.currentProject)) {
+      sel.value = S.currentProject;
+    }
 
     const rows = batchJobsCache.map(j => {
       const isDefaultChecked = preSelectedJobId ? (j.job_id === preSelectedJobId) : (!j.project || j.project === '未分组');
@@ -894,7 +1136,7 @@ async function submitBatchProject() {
     if (!res.ok) throw new Error(res.error || '移动失败');
     toast(`已成功将 ${res.updated} 份图纸归入工程「${targetProj}」`);
     closeBatchProjectModal();
-    loadProjects();
+    if (S.route === 'project') renderProjectPage(); else loadProjects();
     fillProjectSelect();
   } catch (err) {
     toast('归入项目失败：' + err.message);
@@ -911,7 +1153,7 @@ async function quickMoveJobProject(jobId, currentProject) {
     });
     if (!res.ok) throw new Error(res.error || '移动失败');
     toast(`已将图纸移动到「${target.trim()}」`);
-    loadProjects();
+    if (S.route === 'project') renderProjectPage(); else loadProjects();
     fillProjectSelect();
   } catch (err) {
     toast('移动失败：' + err.message);
@@ -922,14 +1164,29 @@ async function quickMoveJobProject(jobId, currentProject) {
 
 function renderQueue() {
   const tb = $('upqueue');
+  const goto = $('up-goto-project');
+  if (goto) {
+    const doneProject = (S.queue.find(f => f.state === 'done' && f.project) || {}).project;
+    if (doneProject) {
+      goto.hidden = false;
+      goto.textContent = `进入项目「${doneProject}」查看结果 →`;
+    } else {
+      goto.hidden = true;
+    }
+  }
   if (!S.queue.length) {
     tb.innerHTML = '<tr><td colspan="4" class="mut2" style="text-align:center;padding:22px">队列为空</td></tr>';
     return;
   }
-  tb.innerHTML = S.queue.map((f, i) => `<tr>
+  tb.innerHTML = S.queue.map((f, i) => {
+    const u = f.ai_usage;
+    const usageBadge = (u && (u.total_tokens || u.calls_count))
+      ? `<span class="pill info" style="font-size:10px;margin-left:4px" title="入:${(u.prompt_tokens||0).toLocaleString()} 出:${(u.completion_tokens||0).toLocaleString()}">📊 ${(u.total_tokens||0).toLocaleString()} tok (￥${(u.total_cost||0).toFixed(4)})</span>`
+      : '';
+    return `<tr>
     <td class="mono">${esc(f.name)}</td><td>${fmtSize(f.size)}</td>
     <td>${f.state === 'done'
-      ? '<span class="pill ok">提取完成</span>'
+      ? `<span class="pill ok">提取完成</span>${usageBadge}${f.project ? `<span class="sub" style="margin-top:3px">已归入项目：${esc(f.project)}</span>` : ''}`
       : f.state === 'failed' ? `<span class="pill bad">失败</span><span class="sub" style="color:var(--bad,#e55353);display:block;margin-top:4px;white-space:pre-wrap;line-height:1.4">${esc(f.error || '')}</span>`
       : f.state === 'uploading' || f.state === 'extracting'
         ? `<span class="pill info">${f.state === 'uploading' ? '上传中' : '提取中'} ${f.progress}%</span>
@@ -937,9 +1194,11 @@ function renderQueue() {
            <div class="progress"><i style="width:${f.progress}%"></i></div>`
         : '<span class="pill">等待提取</span>'}</td>
     <td>${f.jobId && f.state === 'done' ? `<button class="linklike" onclick="openJob('${f.jobId}')">进入工作台</button>`
+      + (f.project ? `<span style="color:var(--line2);margin:0 5px">|</span><button class="linklike" onclick="openProject(decodeURIComponent('${safeJsArg(f.project)}'))">${esc(f.project)}</button>` : '')
       : f.state === 'failed'
         ? `<button class="linklike" style="color:var(--acc);margin-right:10px;font-weight:600" onclick="retryQueued(${i})">重试</button><button class="linklike" onclick="removeQueued(${i})">移除</button>`
-        : `<button class="linklike" onclick="removeQueued(${i})">移除</button>`}</td></tr>`).join('');
+        : `<button class="linklike" onclick="removeQueued(${i})">移除</button>`}</td></tr>`;
+  }).join('');
 }
 
 function retryQueued(i) {
@@ -1007,6 +1266,11 @@ async function startExtract() {
     }
   }
   fillProjectSelect();
+  renderUploadTarget();
+  const done = S.queue.filter(f => f.state === 'done' && f.jobId);
+  if (done.length) {
+    toast('提取完成，点「进入项目」查看这批图纸');
+  }
 }
 
 async function pollJob(item) {
@@ -1041,8 +1305,12 @@ async function pollJob(item) {
       item.state = 'done';
       item.progress = 100;
       item.note = '';
+      item.ai_usage = job.ai_usage || job.summary?.ai_usage;
+      item.project = job.project || '';
       renderQueue();
-      toast('提取完成，可进入工作台核对');
+      if (item.project && !S.currentProject && !$('uploadProject').value) S.currentProject = item.project;
+      renderUploadTarget();
+      toast('提取完成' + (item.project ? `，已归入「${item.project}」` : '') + '，可进入工作台核对');
       return;
     }
     if (job.status === 'failed') {
@@ -1073,6 +1341,8 @@ async function fillProjectSelect() {
   sel.innerHTML = '<option value="">未分组</option>' +
     projects.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
   if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+  else if (S.currentProject && [...sel.options].some(o => o.value === S.currentProject)) sel.value = S.currentProject;
+  renderUploadTarget();
 }
 
 /* ===================== 工作台：加载与渲染 ===================== */
@@ -1084,6 +1354,7 @@ async function openJob(jobId) {
     S.job = job;
     S.data = job.data || { boxes: [], circuits: [], components: [], requirements: [], uncertainties: [] };
     S.changes = job.changes || [];
+    if (job.project) S.currentProject = job.project;
     snapshotOrigins();
     S.pages = Math.max(1, job.pages || 1);
     S.sheetNames = job.sheet_names || {};
@@ -1156,7 +1427,11 @@ function updateWorkbenchCrumb() {
   const curSheetName = (S.sheetNames && (S.sheetNames[S.page] || S.sheetNames[String(S.page)])) || '';
   const sheetTag = curSheetName ? `<span style="background:var(--acc-t);color:var(--acc-d);padding:2px 7px;border-radius:2px;font-weight:600;margin:0 4px">${esc(curSheetName)}</span>` : '';
   const reparseBtn = `<button class="linklike" style="margin-left:12px;font-size:11px;padding:2px 7px;border:1px solid var(--line2);border-radius:3px;background:var(--card)" onclick="reparseJob('${S.jobId}')" title="无需重新上传，以最新引擎与提取规则重新解析本图纸">🔄 重新提取</button>`;
-  $('crumb').innerHTML = `<b>${esc(job.filename || '')}</b>　/　${sheetTag}${box ? esc(box.name || '配电箱') + ' ' + esc(box.code || '') : '未识别箱体'}　<span class="mut2">· 第 ${S.page}/${S.pages} 块</span>${reparseBtn}`;
+  const proj = job.project || '';
+  const projPart = proj
+    ? `<button class="linklike" style="font-size:11px;padding:2px 7px;border:1px solid var(--line2);border-radius:3px;background:var(--card)" onclick="openProject(decodeURIComponent('${safeJsArg(proj)}'))" title="回到项目工作区">📂 ${esc(proj)}</button>　›　`
+    : '';
+  $('crumb').innerHTML = `${projPart}<b>${esc(job.filename || '')}</b>　/　${sheetTag}${box ? esc(box.name || '配电箱') + ' ' + esc(box.code || '') : '未识别箱体'}　<span class="mut2">· 第 ${S.page}/${S.pages} 块</span>${reparseBtn}`;
 }
 
 function renderWorkbench() {
@@ -1178,7 +1453,26 @@ function renderWorkbench() {
   }
 
   const [model, prompt, contract] = modelMeta(job);
-  $('verline').textContent = `模型 ${model} · 提示词 ${prompt} · 契约 ${contract}`;
+  const u = job.ai_usage || job.summary?.ai_usage;
+  const uPill = $('aiusagepill');
+  if (uPill) {
+    if (u && (u.total_tokens || u.calls_count || u.prompt_tokens)) {
+      uPill.hidden = false;
+      const tTok = (u.total_tokens || 0).toLocaleString();
+      const pTok = (u.prompt_tokens || 0).toLocaleString();
+      const cTok = (u.completion_tokens || 0).toLocaleString();
+      const cost = (u.total_cost || 0).toFixed(4);
+      uPill.innerHTML = `📊 ${tTok} Tok <span style="font-weight:normal;opacity:0.8">(入:${pTok} 出:${cTok})</span> · ￥${cost}`;
+      uPill.title = `点击查看 ${job.filename} 的 Token 消耗与计费流水 (${u.calls_count || 1} 次调用)`;
+    } else {
+      uPill.hidden = true;
+    }
+  }
+
+  const costStr = (u && (u.total_tokens || u.calls_count))
+    ? ` · 消耗 ${(u.total_tokens || 0).toLocaleString()} Tok · ￥${(u.total_cost || 0).toFixed(4)}`
+    : '';
+  $('verline').textContent = `模型 ${model} · 提示词 ${prompt} · 契约 ${contract}${costStr}`;
   $('sb-left').textContent = job.created_at ? `提取于 ${job.created_at.replace('T', ' ')}` : '未打开图纸';
   $('sb-mid').textContent = '回路是唯一可编辑来源，保存后元器件汇总按回路重新生成';
 
@@ -1587,9 +1881,28 @@ function renderSub(sub) {
   renderListFoot();
 }
 
+// 平替品牌清单与默认值来自后端配置（/api/settings），不在前端写死
+function brandOptions() {
+  const configured = (S.settings && S.settings.target_brands) || [];
+  if (configured.length) return configured;
+  const info = S.brandInfo || {};
+  return info.target_brands || [];
+}
+
+function defaultTargetBrand() {
+  return (S.brandInfo && S.brandInfo.default_target_brand)
+    || (S.settings && S.settings.default_target_brand) || '';
+}
+
+function brandSelectOptions(selected) {
+  const brands = brandOptions();
+  const current = selected || defaultTargetBrand() || brands[0] || '';
+  return brands.map(b => `<option value="${esc(b)}"${b === current ? ' selected' : ''}>${esc(b)}</option>`).join('');
+}
+
 async function renderReplacementTable(targetBrand) {
   if (targetBrand) S.targetBrand = targetBrand;
-  const brand = S.targetBrand || '正泰';
+  const brand = S.targetBrand || defaultTargetBrand() || brandOptions()[0] || '';
   const th = $('th'), tb = $('tb');
 
   th.innerHTML = `<tr>
@@ -1599,9 +1912,7 @@ async function renderReplacementTable(targetBrand) {
       <div style="display:flex;align-items:center;justify-content:space-between">
         <span>平替推荐型号</span>
         <select id="brandSelect" onchange="renderReplacementTable(this.value)" style="padding:1px 4px;font-size:11px;border:1px solid var(--line);border-radius:3px;background:var(--bg)">
-          <option value="正泰"${brand === '正泰' ? ' selected' : ''}>正泰 CHINT</option>
-          <option value="德力西"${brand === '德力西' ? ' selected' : ''}>德力西 DELIXI</option>
-          <option value="良信"${brand === '良信' ? ' selected' : ''}>良信 NADER</option>
+          ${brandSelectOptions(brand)}
         </select>
       </div>
     </th>
@@ -1749,7 +2060,7 @@ function renderListFoot(customHtml) {
     return;
   }
   if (S.sub === 'replace') {
-    foot.textContent = '按实际设计规格1:1精准平替 · 支持正泰/德力西/良信多品牌一键切换对比';
+    foot.textContent = '按实际设计规格1:1精准平替 · 支持多品牌一键切换对比（可选品牌由后端配置决定）';
     return;
   }
   if (S.sub === 'boxes') {
@@ -2028,6 +2339,26 @@ function renderReview() {
   const un = unresolved().length;
   const recon = S.data.reconciliation;
 
+  const u = S.job?.ai_usage || S.job?.summary?.ai_usage;
+  let aiUsageHtml = '';
+  if (u && (u.total_tokens || u.calls_count || u.prompt_tokens)) {
+    const tTok = (u.total_tokens || 0).toLocaleString();
+    const pTok = (u.prompt_tokens || 0).toLocaleString();
+    const cTok = (u.completion_tokens || 0).toLocaleString();
+    const cost = (u.total_cost || 0).toFixed(4);
+    aiUsageHtml = `
+    <div style="background:#f0f9ff;border:1px solid #bae6fd;padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:12px;display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <span style="font-weight:700;color:#0369a1">📊 AI 模型调用消耗统计</span>
+        <span class="mut" style="margin-left:8px;font-size:11px">模型：${esc(u.model || S.job?.summary?.meta?.model || 'deepseek-flash')} ｜ 调用：${u.calls_count || 1} 次</span>
+        <div style="margin-top:4px;color:#334155;font-family:monospace">
+          Token: <b>${tTok}</b> (入: ${pTok} / 出: ${cTok}) ｜ 费用: <b style="color:#0284c7">￥${cost}</b>
+        </div>
+      </div>
+      <button class="btn sm ghost" onclick="openJobAiUsage()" style="font-size:11px;padding:3px 8px">查看账单明细</button>
+    </div>`;
+  }
+
   let reconHtml = '';
   if (recon && recon.has_catalog) {
     const isBad = recon.missing_count > 0;
@@ -2066,7 +2397,7 @@ function renderReview() {
     </div>`;
   }
 
-  $('rvlist').innerHTML = reconHtml + (items.length ? (topBar + items.map((u, i) => {
+  $('rvlist').innerHTML = aiUsageHtml + reconHtml + (items.length ? (topBar + items.map((u, i) => {
     let tagClass = 'warn';
     let tagText = '待核对';
     if (u.resolved) {
@@ -2157,10 +2488,8 @@ async function resolveAllAndExport() {
 async function triggerAiReviewAndExport() {
   await triggerAiReview();
   const left = unresolved().length;
-  if (left > 0) {
-    toast(`AI 复核后仍有 ${left} 处待人工核对，请处理后再导出`);
-    return;
-  }
+  // 复核完直接导出：剩下的待核对项会如实写进 Excel，不再挡着下载
+  if (left > 0) toast(`AI 复核完成，仍有 ${left} 处待人工核对，已一并写入 Excel 待核对区`);
   await doExport();
 }
 
@@ -2330,7 +2659,9 @@ function openExport() {
   const cross = (S.data.uncertainties || []).filter(u => /回路逐条计数/.test(u.detail || '')).length;
   const pending = pendingChanges().length;
   const checks = [
-    { ok: un === 0, title: '存疑项状态', note: un === 0 ? `共 ${(S.data.uncertainties || []).length} 项，全部已确认` : `还有 ${un} 项待核对（可一键全部通过或AI复核）` },
+    { ok: true, title: '存疑项状态', note: un === 0
+        ? `共 ${(S.data.uncertainties || []).length} 项，全部已确认`
+        : `还有 ${un} 项待核对——不影响导出，会一并写进 Excel 的待核对区` },
     { ok: circuits > 0, title: '回路明细完整', note: `${circuits} 条回路` },
     { ok: comps > 0 && cross === 0, title: '元器件已按回路重新汇总', note: cross ? `有 ${cross} 条回路与汇总数量存在差异，已作工程标记` : `${comps} 项，与回路逐条计数一致` },
     { ok: true, title: pending ? `还有 ${pending} 处修改没保存` : '修改已留痕', note: pending ? '点「保存」后再导出，否则未保存修改不会进入变更记录' : `${S.changes.length} 处修改，随清单导出变更记录` },
@@ -2346,26 +2677,57 @@ function openExport() {
         : `目录声明 ${recon.total_declared_panels} 个箱体 100% 覆盖提取`
     });
   }
+  // 切片覆盖率与独立交叉验证结果：这是“切准了没”“解析准了没”的可核验凭证，导出前必须看见
+  const summary = (S.job && S.job.summary) || {};
+  const slice = summary.slice_plan;
+  if (slice) {
+    const cov = slice.tile_coverage;
+    const covered = !cov || cov.fully_covered;
+    checks.push({
+      ok: covered,
+      title: '切片覆盖自检',
+      note: slice.tiles
+        ? `${slice.total_images} 页切成 ${slice.tiles} 块，覆盖 ${cov ? (cov.covered_area_ratio * 100).toFixed(2) + '%' : '-'}（${covered ? '已铺满整页' : '存在漏区'}）`
+        : `${slice.total_images} 页均为整页送检，未触发切片`
+    });
+  }
+  const corr = summary.corroboration;
+  if (corr) {
+    if (!corr.available) {
+      checks.push({
+        ok: true,
+        title: '关键字段独立交叉验证',
+        note: '本图没有可用的原生文字（文字已转曲或未提供矢量文字层），没有第二个来源可交叉验证，关键字段请人工抽查'
+      });
+    } else {
+      const rate = (corr.corroboration_rate !== undefined ? corr.corroboration_rate : corr.coverage_rate) || 0;
+      checks.push({
+        ok: corr.unverified === 0,
+        title: '关键字段独立交叉验证',
+        note: `${corr.values_checked} 个关键字段中用${corr.source === 'cad_native' ? 'CAD 矢量文字' : 'PDF 文字层'}命中 ${corr.corroborated} 个（${(rate * 100).toFixed(1)}%）`
+          + (corr.unverified ? `，${corr.unverified} 个未命中已列入待核对（未命中不等于错误）` : '')
+      });
+    }
+  }
   $('expsub').textContent = `${S.job ? S.job.filename : ''} · 导出前检查`;
   $('expchecks').innerHTML = checks.map(c => `<div class="chk${c.ok ? '' : ' bad'}">
     <span class="c">${c.ok ? '✓' : '!'}</span><div>${esc(c.title)}<small>${esc(c.note)}</small></div></div>`).join('');
   const meta = (S.job && S.job.summary && S.job.summary.meta) || {};
   $('expver').textContent = `模型 ${meta.model || '-'} · 提示词 v${meta.prompt_version || '-'} · 契约 v${meta.contract_version || '-'}`;
 
+  // 导出永远只有一条主路径：点下去就下载。存疑项不遮挡交付，
+  // 「AI 复核后导出」「一键确认后导出」只是可选的数据质量快捷方式，不是前置条件。
   const mactions = document.querySelector('#expmodal .mactions');
   if (mactions) {
-    if (un > 0) {
-      mactions.innerHTML = `
-        <button class="btn ghost sm" onclick="closeExport()">取消</button>
-        <button class="btn sm" onclick="triggerAiReviewAndExport()" title="让 AI 全盘复核存疑项，复核后自动尝试导出；若仍有存疑未确认，导出会被中止" style="background:#4f46e5;color:#fff;border:none">🤖 AI复核并导出</button>
-        <button class="btn primary sm" onclick="resolveAllAndExport()" title="一键将剩余 ${un} 处待核对项全部标记为已确认并直接下载（由你担责确认）" style="background:#16a34a;border:none">✅ 一键确认并导出</button>
-      `;
-    } else {
-      mactions.innerHTML = `
-        <button class="btn ghost sm" onclick="closeExport()">取消</button>
-        <button class="btn primary sm" id="expok" onclick="doExport()">确认导出</button>
-      `;
-    }
+    mactions.innerHTML = `
+      <button class="btn ghost sm" onclick="closeExport()">取消</button>
+      ${un > 0 ? `
+        <button class="linklike" style="margin-right:12px" onclick="triggerAiReviewAndExport()"
+                title="让 AI 全盘复核待核对项，复核完自动下载；没有把握的项会保留在 Excel 待核对区">🤖 AI 复核后导出</button>
+        <button class="linklike" style="margin-right:12px" onclick="resolveAllAndExport()"
+                title="把剩余 ${un} 处待核对项标记为已确认再导下载">✅ 一键确认后导出</button>` : ''}
+      <button class="btn primary sm" id="expok" onclick="doExport()">${un > 0 ? `直接导出（含 ${un} 处待核对）` : '确认导出'}</button>
+    `;
   }
   $('expmodal').classList.add('show');
 }
@@ -2380,12 +2742,13 @@ async function doExport() {
     if (Auth.token) headers['Authorization'] = `Bearer ${Auth.token}`;
     const res = await fetch(`/api/jobs/${S.jobId}/excel`, { headers });
     if (res.status === 409) {
-      // 后端门禁：存疑未确认完不许导出
+      // 只有当 config/delivery.json 把 export_gate.block_unresolved_default 打开时才会走到这里
       let n = '?';
       try { const j = await res.json(); if (j && j.detail && j.detail.unresolved_count != null) n = j.detail.unresolved_count; } catch (e) {}
       closeExport();
-      toast(`导出已中止：还有 ${n} 处存疑未确认`);
-      addMsg('sys', `导出被拦截：还有 ${n} 处存疑未确认。请先逐项核对、用 AI 复核，或点「一键确认并导出」由你担责确认后再导出。`);
+      toast(`导出被拦下：还有 ${n} 处存疑未确认（该项目开启了导出前门禁）`);
+      addMsg('sys', `导出被拦截：还有 ${n} 处存疑未确认。当前项目开启了“存疑未清零不许导出”的门禁；`
+        + '逐项核对或用「一键确认后导出」即可，也可以让管理员关闭该门禁。');
       return;
     }
     if (!res.ok) throw new Error('服务端没有生成 Excel');
@@ -3194,7 +3557,9 @@ async function loadHistory() {
   $('histcount').textContent = history.length ? `共 ${history.length} 次导出` : '';
   $('histrows').innerHTML = history.map(h => `<tr>
     <td class="mono" style="font-size:11px">${esc((h.exported_at || '').replace('T', ' ').slice(0, 16))}</td>
-    <td><b>${esc(h.project || '未分组')}</b></td>
+    <td>${h.project
+      ? `<button class="linklike" onclick="openProject(decodeURIComponent('${safeJsArg(h.project)}'))"><b>${esc(h.project)}</b></button>`
+      : '<span class="mut">未分组</span>'}</td>
     <td class="mono">${esc(h.filename || '')}</td>
     <td>${h.circuits || 0}</td>
     <td>${h.unresolved ? `<span class="pill warn">${h.unresolved} 未确认</span>`
@@ -3214,6 +3579,7 @@ async function loadHistory() {
 
 async function loadSettings() {
   const info = await api('/api/settings');
+  S.brandInfo = { target_brands: info.target_brands || [], default_target_brand: info.default_target_brand || '' };
   const s = info.settings;
   S.settings = s;
   $('set-model').value = s.vision_model || '';
@@ -3404,11 +3770,18 @@ async function boot() {
   await fillProjectSelect();
   const { projects } = await api('/api/projects');
   const hasJobs = projects.some(p => (p.jobs || []).length);
-  navGo('projects');
-  if (hasJobs) {
-    hideStart();
+
+  // 地址栏带 hash（刷新或分享链接）时优先按它恢复位置
+  const restored = await applyHashRoute();
+  if (!restored) {
+    navGo('projects');
+    // 启动屏只在“真·第一次用”时出现：已经有项目就直接进项目列表，
+    // 否则用户建完项目刷新又被欢迎页挡住，会以为项目没建成。
+    const isFirstRun = projects.length === 0 && !hasJobs;
+    if (isFirstRun) $('startscreen').hidden = false;
+    else hideStart();
   } else {
-    $('startscreen').hidden = false;
+    hideStart();
   }
   $('ubadge').onclick = () => {
     if (!S.jobId) { toast('先去项目里打开一份图纸'); return; }

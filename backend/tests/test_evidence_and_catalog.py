@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
+import test_support  # noqa: F401
 
 from extractor.schema import (
     Box,
@@ -233,10 +234,10 @@ class TestEvidenceAndCatalogReconciler(unittest.TestCase):
         self.assertEqual(len(res.boxes), 1)
         self.assertEqual(len(res.circuits), 1)
 
-        # 验证 Box Claims
+        # 验证 Box Claims (未有人工确认或物理锚定时，默认为 PARSED_OK 或 UNASSESSED，严禁自封 CONFIRMED)
         box = res.boxes[0]
         self.assertIn("box.code", box.claims)
-        self.assertEqual(box.claims["box.code"].review_status, ReviewStatus.CONFIRMED.value)
+        self.assertEqual(box.claims["box.code"].review_status, ReviewStatus.PARSED_OK.value)
         self.assertIn("box.location", box.claims)
         self.assertEqual(box.claims["box.location"].review_status, ReviewStatus.UNASSESSED.value)
 
@@ -254,9 +255,9 @@ class TestEvidenceAndCatalogReconciler(unittest.TestCase):
 
         # 验证 Circuit Claims
         self.assertIn("circuit.circuit_no", c.claims)
-        self.assertEqual(c.claims["circuit.circuit_no"].review_status, ReviewStatus.CONFIRMED.value)
+        self.assertEqual(c.claims["circuit.circuit_no"].review_status, ReviewStatus.PARSED_OK.value)
         self.assertIn("circuit.breaker", c.claims)
-        self.assertEqual(c.claims["circuit.breaker"].review_status, ReviewStatus.CONFIRMED.value)
+        self.assertEqual(c.claims["circuit.breaker"].review_status, ReviewStatus.PARSED_OK.value)
 
     def test_sync_result_issues_preserves_three_tier_severities(self):
         """验证 _sync_result_issues 将 CheckIssue 精准映射至 uncertainties 并保留 ERROR/WARNING/INFO。"""
@@ -696,7 +697,6 @@ class TestEvidenceAndCatalogReconciler(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 
 
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""自动化测试：验证元器件特征解析、自动组价核算、母排铜排公式与多品牌比价矩阵"""
+"""自动化测试：验证规格解析、报价公式、钣金估算、费率计算与本地价格记录查询。"""
 import unittest
 from extractor.pricing import (
     parse_component_features,
@@ -7,7 +7,14 @@ from extractor.pricing import (
     estimate_box_enclosure_price,
     estimate_copper_busbar_cost,
     calculate_box_quotation,
+    calculate_box_ab_quotation,
     compare_brands_quotation,
+    lookup_price_library,
+    get_price_library_stats,
+    calc_enclosure_unfolding,
+    calc_copper_bar_quote,
+    parse_box_dimensions,
+    norm_brand,
 )
 
 
@@ -110,6 +117,129 @@ class TestPricingEngine(unittest.TestCase):
         q = calculate_box_quotation(box, circuits, [], brand="正泰")
         self.assertEqual(q["cost_breakdown"]["copper_busbar_cost"], 0.0)
         self.assertEqual(q["cost_breakdown"]["labor_cost"], 45.0)  # 仅 1 个出线回路 45 元，无进线 120 元
+
+    def test_51k_price_library_stats_and_matching(self):
+        """验证本地 SQLite 价格库记录数量与查询行为；不验证价格来源或有效期。"""
+        stats = get_price_library_stats()
+        self.assertTrue(stats["available"])
+        self.assertGreater(stats["total_count"], 50000)
+        self.assertIn("德力西", stats["brands"])
+        self.assertIn("正泰", stats["brands"])
+        self.assertIn("施耐德", stats["brands"])
+        self.assertIn("上海良信", stats["brands"])
+
+        # 品牌别名归一化
+        self.assertEqual(norm_brand("良信"), "上海良信")
+        self.assertEqual(norm_brand("施耐德电气"), "施耐德")
+        self.assertEqual(norm_brand("正泰电器"), "正泰")
+        self.assertEqual(norm_brand("delixi"), "德力西")
+
+        # 本地价格记录精确及特征匹配查询
+        mcb_chint = lookup_price_library("MCB", "正泰", poles="1P", curr_a=16)
+        self.assertIsNotNone(mcb_chint)
+        self.assertGreater(mcb_chint["price_tax"], 0.0)
+        self.assertIn("正泰", mcb_chint["brand"])
+
+        mcb_schneider = lookup_price_library("MCB", "施耐德", poles="1P", curr_a=16)
+        self.assertIsNotNone(mcb_schneider)
+        self.assertGreater(mcb_schneider["price_tax"], mcb_chint["price_tax"])
+
+        mccb_delixi = lookup_price_library("MCCB", "德力西", poles="3P", curr_a=125)
+        self.assertIsNotNone(mccb_delixi)
+        self.assertGreater(mccb_delixi["price_tax"], 0.0)
+
+    def test_sheet_metal_unfolding_area_method(self):
+        """验证工业级非标箱体钣金展开面积法 (calc_enclosure_unfolding) 与尺寸解析"""
+        # 1. 尺寸正则解析
+        d1 = parse_box_dimensions("800*600*200")
+        self.assertIsNotNone(d1)
+        self.assertEqual(d1, (800.0, 600.0, 200.0))
+
+        d2 = parse_box_dimensions("GGD 800×2200×600")
+        self.assertIsNotNone(d2)
+        self.assertEqual(d2, (800.0, 2200.0, 600.0))
+
+        # 2. 600x800x250 安装板 (A=2.0) 展开面积法核算
+        unfold = calc_enclosure_unfolding(600, 800, 250, box_type="安装板", material="冷轧钢板", thickness=1.5)
+        self.assertEqual(unfold["A"], 2.0)
+        self.assertGreater(unfold["total_area_m2"], 2.0)
+        self.assertGreater(unfold["total_price"], 300.0)
+        self.assertIn("钣金展开法", unfold["desc"])
+
+        # 3. 落地动力柜 800x1800x600 2.0mm 展开面积法核算
+        unfold_floor = calc_enclosure_unfolding(800, 1800, 600, box_type="安装板+支架+封板", material="冷轧钢板", thickness=2.0)
+        self.assertEqual(unfold_floor["A"], 3.5)
+        self.assertGreater(unfold_floor["total_area_m2"], 10.0)
+        self.assertGreater(unfold_floor["total_price"], 1800.0)
+
+        # 4. 箱体询价自动接驳展开面积法
+        p_unfold, desc_u = estimate_box_enclosure_price({"box_type": "600x800x250", "ip_rating": "IP30"}, circuits_count=8)
+        self.assertIn("钣金展开法", desc_u)
+        self.assertAlmostEqual(p_unfold, unfold["total_price"], places=1)
+
+    def test_power_cabinet_12m_copper_busbar_quota(self):
+        """验证低压动力配电柜 12 米标准铜排定额计算 (calc_copper_bar_quote)"""
+        # 1600A -> 100x10 规格, 12m, 铜密度 8.9: 重量 = 1000 * 12 * 8.9 / 1000 = 106.8 kg
+        q_1600 = calc_copper_bar_quote(1600, length_m=12.0, qty=1, price_per_kg=76.50)
+        self.assertEqual(q_1600["spec"], "TM-100x10")
+        self.assertAlmostEqual(q_1600["weight_kg"], 106.8, places=2)
+        self.assertAlmostEqual(q_1600["total_price"], round(106.8 * 76.50, 2), places=1)
+
+        # 630A -> 60x6 规格
+        q_630 = calc_copper_bar_quote(630, length_m=12.0)
+        self.assertEqual(q_630["spec"], "TM-60x6")
+        self.assertGreater(q_630["total_price"], 2000.0)
+
+        # 100A -> 20x3 规格
+        q_100 = calc_copper_bar_quote(100, length_m=12.0)
+        self.assertEqual(q_100["spec"], "TM-20x3")
+
+        # 未标注电流返回 0.0 与待核定提示
+        q_zero = calc_copper_bar_quote(0)
+        self.assertEqual(q_zero["total_price"], 0.0)
+        self.assertIn("未标注", q_zero["desc"])
+
+    def test_ab_differential_quota_model(self):
+        """验证成套厂通行的 A/B 差异化成套费率定额模型 (造价极客标准六步法)"""
+        box = {"box_code": "AP1", "box_type": "600x800x250", "ip_rating": "IP30"}
+        circuits = [
+            {"circuit_type": "incoming", "breaker_spec": "MCCB-3P-125A", "load_name": "进线"},
+            {"circuit_type": "outgoing", "breaker_spec": "MCB-C16A/1P", "load_name": "照明1"},
+            {"circuit_type": "outgoing", "breaker_spec": "MCB-C32A/3P", "load_name": "动力1"},
+        ]
+        comps = [
+            {"name": "塑壳断路器", "spec": "MCCB-3P-125A", "quantity": 1},
+            {"name": "微断", "spec": "MCB-C16A/1P", "quantity": 1},
+            {"name": "微断", "spec": "MCB-C32A/3P", "quantity": 1},
+        ]
+
+        # 1. 国产品牌 (正泰): A=16.7%, B=19.7%
+        q_dom = calculate_box_quotation(box, circuits, comps, brand="正泰")
+        ab_d = q_dom["ab_quotation"]
+        self.assertAlmostEqual(ab_d["A"], 0.167, places=3)
+        self.assertAlmostEqual(ab_d["B"], 0.197, places=3)
+        # 验证六步递推准确性
+        # ① 主要元件
+        self.assertEqual(ab_d["sum_main"], ab_d["steps"][0]["amount"])
+        # ② 辅材 = ① × A
+        self.assertAlmostEqual(ab_d["sum_aux"], round(ab_d["sum_main"] * 0.167, 2), places=1)
+        # ③ 材料合计 = ① + ②
+        self.assertAlmostEqual(ab_d["sum_mat"], round(ab_d["sum_main"] + ab_d["sum_aux"], 2), places=1)
+        # ④ 成套费用 = ③ × B
+        self.assertAlmostEqual(ab_d["sum_set"], round(ab_d["sum_mat"] * 0.197, 2), places=1)
+        # ⑥ 单箱总报价 = ③ + ④ + ⑤
+        self.assertAlmostEqual(ab_d["sum_total"], round(ab_d["sum_mat"] + ab_d["sum_set"] + ab_d["sum_box"], 2), places=1)
+
+        # 2. 合资品牌 (施耐德): A=12.0%, B=18.3%
+        q_jv = calculate_box_quotation(box, circuits, comps, brand="施耐德")
+        ab_jv = q_jv["ab_quotation"]
+        self.assertAlmostEqual(ab_jv["A"], 0.120, places=3)
+        self.assertAlmostEqual(ab_jv["B"], 0.183, places=3)
+        self.assertIn("合资品牌定额", ab_jv["ab_label"])
+
+        # 3. 使用便捷函数 calculate_box_ab_quotation 返回含税 A/B 总价
+        q_ab = calculate_box_ab_quotation(box, circuits, comps, brand="正泰")
+        self.assertEqual(q_ab["final_tax_included"], q_ab["ab_quotation"]["sum_total"])
 
 
 if __name__ == "__main__":

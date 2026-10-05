@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+import test_support  # noqa: F401
 import openpyxl
 from fastapi.testclient import TestClient
 
@@ -201,7 +202,7 @@ class TestV3Features(unittest.TestCase):
         self.assertEqual(resp_excel.status_code, 200)
         self.assertIn("application/vnd.openxmlformats-officedocument", resp_excel.headers["content-type"])
 
-        # 4. 存疑未确认完导出必须 409（force=true 才放行）
+        # 4. 存疑未确认也照常可导出（导出是交付动作，不被存疑项遮挡）
         test_id2 = "test_export409_" + uuid.uuid4().hex[:6]
         jobs[test_id2] = {
             "job_id": test_id2,
@@ -220,13 +221,10 @@ class TestV3Features(unittest.TestCase):
             "changes": []
         }
         save_job(test_id2)
-        resp_409 = self.client.get(f"/api/jobs/{test_id2}/excel")
-        self.assertEqual(resp_409.status_code, 409, "有未确认存疑时导出应返回 409")
-        self.assertEqual(resp_409.json()["detail"]["unresolved_count"], 1)
-        resp_force = self.client.get(f"/api/jobs/{test_id2}/excel?force=true")
-        self.assertEqual(resp_force.status_code, 200, "force=true 时应放行导出")
+        resp_ok = self.client.get(f"/api/jobs/{test_id2}/excel")
+        self.assertEqual(resp_ok.status_code, 200, "有未确认存疑时默认也应当能直接导出")
+        self.assertIn("application/vnd.openxmlformats-officedocument", resp_ok.headers["content-type"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

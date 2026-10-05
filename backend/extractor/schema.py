@@ -6,8 +6,20 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .config import pipeline
+
 PROMPT_VERSION = "3.0"
 CONTRACT_VERSION = "3.0"
+
+# 证据来源定义：只有独立于模型自述的来源才算物理事实证据。
+# 取值来自 config/pipeline.json 的 evidence 段，可用环境变量/覆盖目录改写。
+PHYSICAL_EVIDENCE_ORIGINS: set[str] = {
+    str(item) for item in (pipeline().get("evidence", {}).get("physical_fact_origins")
+                           or ["cad_native", "ocr", "human"])
+}
+MODEL_EVIDENCE_ORIGIN: str = str(
+    pipeline().get("evidence", {}).get("model_origin") or "model_vision"
+)
 
 
 class EvidenceType(str, Enum):
@@ -39,6 +51,16 @@ class Evidence(BaseModel):
     raw_content: str = Field("", description="提取的原始文字或图例类别")
     bbox: Optional["BBox"] = Field(None, description="图元规范页面归一化坐标")
     confidence: float = Field(1.0, ge=0.0, le=1.0, description="证据可信度")
+    origin: str = Field("", description="证据来源：cad_native / ocr / human / model_vision。空值视为来源不明，不得用于放行物理事实字段")
+
+    @property
+    def is_physical_fact(self) -> bool:
+        """是否属于独立于模型自述的物理事实证据。
+
+        必须由本属性判断，而不是只看 evidence_type：模型自述也会被记为 TEXT，
+        若只按类型放行，就变成“模型给自已的答案作证”的循环论证。
+        """
+        return self.origin in PHYSICAL_EVIDENCE_ORIGINS
 
 
 class GroundedField(BaseModel):
@@ -80,8 +102,13 @@ FIELD_EVIDENCE_POLICY: dict[str, set[str]] = {
 }
 
 
-def validate_field_evidence(field_path: str, evidence_type: str) -> tuple[bool, str]:
-    """校验字段是否符合证据政策要求。返回 (is_valid, violation_message)。"""
+def validate_field_evidence(field_path: str, evidence_type: str,
+                            origin: str | None = None) -> tuple[bool, str]:
+    """校验字段是否符合证据政策要求。返回 (is_valid, violation_message)。
+
+    origin 传入时同时校验来源：要求“物理事实证据”的字段不接受 model_vision 自述，
+    否则模型会用自己的输出给自己作证。
+    """
     allowed = FIELD_EVIDENCE_POLICY.get(field_path)
     if not allowed:
         return True, ""
@@ -91,6 +118,15 @@ def validate_field_evidence(field_path: str, evidence_type: str) -> tuple[bool, 
             f"字段 '{field_path}' 违反证据政策：检测到证据/推断类型 '{evidence_type}'，"
             f"但该字段强制要求使用 [{', '.join(sorted(allowed))}] 物理事实证据，严禁无据臆测！"
         )
+    if origin is not None and "MODEL" not in norm_type:
+        # “纯事实字段”= 政策里既不给模型推断也不给规则推断开口子，只能靠看得见的证据。
+        inference_tokens = {"MODEL", "MODEL_INFERENCE", "RULE", "RULE_INFERENCE"}
+        needs_physical = not (inference_tokens & allowed)
+        if needs_physical and origin not in PHYSICAL_EVIDENCE_ORIGINS:
+            return False, (
+                f"字段 '{field_path}' 仅有来源 '{origin or '未知'}' 的证据，"
+                f"缺少独立于模型自述的物理证据（{'/'.join(sorted(PHYSICAL_EVIDENCE_ORIGINS))}）交叉验证"
+            )
     return True, ""
 
 
@@ -262,6 +298,16 @@ class CatalogReconciliation(BaseModel):
     missing_box_codes: List[str] = Field(default_factory=list, description="遗漏的配电箱编号列表")
 
 
+class ProjectInfo(BaseModel):
+    """图纸图签中可见的项目信息。只记图上看得到的，没有就留空，不得推测。"""
+    name: str = Field("", description="工程名称/项目名称，必须与图签逐字一致")
+    code: str = Field("", description="工程编号/项目编号")
+    client: str = Field("", description="建设单位/业主单位")
+    designer: str = Field("", description="设计单位")
+    location: str = Field("", description="建设地点")
+    note: str = Field("", description="备注")
+
+
 class RawExtraction(BaseModel):
     """Only facts observed by the model; no model-computed totals or title."""
     model_config = ConfigDict(extra="forbid")
@@ -273,6 +319,9 @@ class RawExtraction(BaseModel):
     catalog_items: List[CatalogItem] = Field(default_factory=list)
     reconciliation: Optional[CatalogReconciliation] = Field(default=None)
     evidence_store: Dict[str, Evidence] = Field(default_factory=dict)
+    # 图签里的项目信息（可选）。缺失不代表出错：图片型 PDF 看不清图签很正常，
+    # 上游会用 CAD 原生文字/文件名兼容，不得因缺失而失败。
+    project_info: Optional[ProjectInfo] = Field(default=None)
 
 
 class DistributionNode(BaseModel):

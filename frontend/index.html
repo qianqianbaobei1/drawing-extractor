@@ -20,14 +20,13 @@
   </div>
   <nav class="nav">
     <button data-p="projects" onclick="navGo('projects')">项目</button>
-    <button data-p="upload" onclick="navGo('upload')">上传</button>
     <button data-p="workbench" onclick="navGo('workbench')">工作台<span class="bdg" id="navbdg" hidden>0</span></button>
     <button data-p="history" onclick="navGo('history')">历史记录</button>
     <button data-p="settings" onclick="navGo('settings')">设置</button>
   </nav>
   <div class="sp"></div>
   <button class="tbtn warn" id="ubadge" onclick="navGo('workbench');openReview()">待核对 0</button>
-  <button class="btn primary sm" onclick="navGo('upload')">上传 PDF</button>
+  <button class="btn primary sm" onclick="startUploadFlow()">上传图纸</button>
 
   <!-- 用户中心 -->
   <div class="user-menu-wrap" id="userMenuWrap">
@@ -103,10 +102,10 @@
         <div class="canvas-empty-title">电柜智核 · 配电箱智能工作台</div>
         <div class="canvas-empty-sub">
           工业级电气图纸多模态解析引擎 · 支持 PDF / AutoCAD DWG / DXF<br>
-          从「项目」选择已解析图纸开始核对与算量，或直接上传新图纸
+          先在「项目」里建项目或进入已有项目，再上传图纸开始核对与算量
         </div>
         <div class="canvas-empty-actions">
-          <button class="btn primary sm" onclick="navGo('upload')">＋ 上传新图纸</button>
+          <button class="btn primary sm" onclick="startUploadFlow()">＋ 上传新图纸</button>
           <button class="btn ghost sm" onclick="navGo('projects')">📂 浏览项目工程</button>
         </div>
       </div>
@@ -125,6 +124,8 @@
     <div class="aistatus">
       <span class="dot" id="aistatedot"></span><span id="aistatetext">未连接</span>
       <span class="mut" id="aistatemeta"></span>
+      <span class="sp"></span>
+      <span class="pill info" id="aiusagepill" style="cursor:pointer;font-family:monospace;font-size:11px;font-weight:600;padding:2px 8px;border-radius:12px;margin-left:auto" onclick="openJobAiUsage()" title="点击查看本图 AI 识别 Token 消耗与计费流水" hidden>📊 0 Tok · ￥0.00</span>
     </div>
     <div class="atabs">
       <button class="active" data-t="list" onclick="atab('list')">清单</button>
@@ -260,23 +261,69 @@
     <button class="btn primary sm" onclick="newProject()">新建项目</button>
   </div>
   <div class="pg-wrap"><div class="card"><table class="ptable">
-    <thead><tr><th>项目名称</th><th>图纸</th><th>箱体</th><th>回路</th><th>AI 识别费用</th><th>待核对</th><th>状态</th><th>更新时间</th><th></th></tr></thead>
+    <thead><tr><th>项目名称</th><th>建设单位</th><th>图纸</th><th>箱体</th><th>回路</th><th>AI 识别费用</th><th>待核对</th><th>状态</th><th>更新时间</th><th></th></tr></thead>
     <tbody id="projrows"></tbody>
   </table></div>
-  <div class="empty" id="projempty" hidden>还没有项目<br>去「上传」新增一张配电系统图 PDF</div>
+  <div class="empty" id="projempty" hidden>还没有项目<br>点右上角「新建项目」建一个项目，或在「上传图纸」时自动从图纸图签建项目</div>
   </div>
 </main>
 
-<!-- ===== 上传 ===== -->
+<!-- ===== 项目工作区（进入某个项目后的一切操作都在这里） ===== -->
+<main class="page" id="page-project" hidden>
+  <div class="pg-head">
+    <button class="btn ghost sm" onclick="navGo('projects')" title="返回项目列表">← 项目列表</button>
+    <h2 id="pj-name">项目</h2>
+    <span id="pj-namesrc"></span>
+    <div class="sp"></div>
+    <button class="btn ghost sm" onclick="renameCurrentProject()" title="项目名不对可以直接改，图纸与账单会一起跟着改">✎ 重命名</button>
+    <button class="btn ghost sm" onclick="openBatchProjectModal()" title="把别的图纸归入本项目">📦 归入图纸</button>
+    <button class="btn primary sm" onclick="uploadToCurrentProject()">＋ 上传图纸到此项目</button>
+  </div>
+  <div class="pg-wrap">
+
+    <div class="card">
+      <div class="ch">项目信息
+        <span class="mut" id="pj-infosrc" style="font-weight:400;font-size:11.5px"></span>
+      </div>
+      <div id="pj-info" style="padding:12px 16px 16px"></div>
+    </div>
+
+    <div class="card"><div id="pj-stats" style="padding:14px 18px"></div></div>
+
+    <div class="card">
+      <div class="ch">
+        图纸清单<span class="mut" id="pj-dwgcount" style="font-weight:400;font-size:11.5px"></span>
+        <span class="sp" style="flex:1"></span>
+        <span style="font-weight:400;font-size:12px">
+          <button class="linklike" onclick="pjBom()">全项目总BOM</button>
+          <span style="color:var(--line2);margin:0 5px">|</span>
+          <button class="linklike" onclick="pjTopology()">供电拓扑</button>
+          <span style="color:var(--line2);margin:0 5px">|</span>
+          <a class="linklike" id="pj-export" href="#" download>导出采购四联表</a>
+        </span>
+      </div>
+      <table class="ptable">
+        <thead><tr><th>图纸</th><th>页数</th><th>箱体</th><th>回路</th><th>元器件</th><th>待核对</th><th>状态</th><th>提取时间</th><th></th></tr></thead>
+        <tbody id="pj-dwgrows"></tbody>
+      </table>
+      <div class="empty" id="pj-dwgempty" hidden>这个项目还没有图纸<br>点右上角「上传图纸到此项目」开始</div>
+    </div>
+  </div>
+</main>
+
+<!-- ===== 上传（项目内动作：先选/建项目，再传图纸） ===== -->
 <main class="page" id="page-upload" hidden>
-  <div class="pg-head"><h2>上传图纸</h2><div class="sp"></div>
+  <div class="pg-head">
+    <button class="btn ghost sm" id="up-back" onclick="backFromUpload()">← 返回项目</button>
+    <h2>上传图纸</h2><div class="sp"></div>
     <label style="font-size:12.5px;color:var(--mut)">归入项目
-      <select id="uploadProject" style="border:1px solid var(--line2);padding:5px 8px;font:inherit;font-size:12.5px;background:#fff">
-        <option value="">未分组</option>
+      <select id="uploadProject" onchange="renderUploadTarget()" style="border:1px solid var(--line2);padding:5px 8px;font:inherit;font-size:12.5px;background:#fff">
+        <option value="">自动识别（按图签工程名称建项目）</option>
       </select>
     </label>
   </div>
   <div class="pg-wrap">
+    <div id="up-target" class="card" style="padding:11px 16px;font-size:12.5px"></div>
     <div class="brand-hero" style="background:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);border:1px solid #334155;color:#f8fafc;padding:16px 22px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-radius:4px">
       <div class="brand-hero-content" style="display:flex;align-items:center;gap:14px">
         <img src="assets/brand/02_品牌Logo/17_App图标主体.png" alt="电柜智核Logo" class="brand-hero-logo" width="46" height="46" style="width:46px;height:46px;object-fit:contain;border-radius:6px;background:rgba(255,255,255,0.08);padding:3px;border:1px solid rgba(255,255,255,0.15);flex-shrink:0">
@@ -333,11 +380,17 @@
     <div class="card"><div class="dropzone slim" id="dropzone">
       <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#2E5CE6" stroke-width="1.4"><path d="M6 2h8l4 4v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z" fill="#E9EFFD"/><path d="M14 2v4h4"/></svg>
       <div class="dz-t">点击选择 PDF / DWG / DXF，或把文件拖到这里</div>
-      <div class="dz-s">支持 PDF、AutoCAD DWG、DXF · 建议单张系统图一个文件</div>
+      <div class="dz-s">支持 PDF、AutoCAD DWG、DXF · 建议单张系统图一个文件 · 自动归入对应工程项目</div>
       <input type="file" id="fileinput" accept=".pdf,.dwg,.dxf,application/pdf" multiple hidden>
     </div></div>
     <div class="card">
-      <div class="ch"><span>待提取队列</span><button class="btn primary sm" onclick="startExtract()">开始提取</button></div>
+      <div class="ch">
+        <span>待提取队列</span>
+        <span style="display:flex;gap:8px;align-items:center">
+          <button class="btn ghost sm" id="up-goto-project" onclick="backFromUpload()" hidden>进入项目查看结果 →</button>
+          <button class="btn primary sm" onclick="startExtract()">开始提取</button>
+        </span>
+      </div>
       <table class="ptable"><thead><tr><th>文件名</th><th>大小</th><th>状态</th><th></th></tr></thead>
         <tbody id="upqueue"><tr><td colspan="4" class="mut2" style="text-align:center;padding:22px">队列为空</td></tr></tbody>
       </table>
@@ -478,9 +531,7 @@
         <span style="font-size:12px;color:var(--mut);">清单模式：</span>
         <select id="projBomModeSelect" class="sm" onchange="switchProjBomMode(this.value)" style="padding:4px 8px;font-size:12px;border:1px solid var(--line);border-radius:4px;background:var(--bg)">
           <option value="raw">原设计采购清单</option>
-          <option value="正泰">正泰一键平替方案</option>
-          <option value="德力西">德力西一键平替方案</option>
-          <option value="良信">良信一键平替方案</option>
+          <!-- 平替品牌选项由 /api/settings 的 target_brands 动态填充 -->
         </select>
         <a id="projBomExportBtn" class="btn primary sm" href="#" download>导出采购四联表 (Excel)</a>
         <button class="btn ghost sm" onclick="closeProjBom()">✕ 关闭</button>
@@ -659,16 +710,17 @@
       </div>
     </div>
     <div class="mut" style="font-size:12px;margin-bottom:16px;line-height:1.5">
-      上传配电箱/配电柜系统图，AI 视觉与 CAD 矢量双核提取元器件，自动生成标准报价与采购清单
+      上传配电箱/配电柜系统图，AI 视觉与 CAD 矢量双核提取元器件，自动生成标准报价与采购清单<br>
+      <span style="font-size:11.5px">上传后会先从图纸图签读取「工程名称」并自动建项目；也可以先进「项目」建好项目再往里面传图纸</span>
     </div>
     <div class="dropzone" id="startdrop">
       <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#2E5CE6" stroke-width="1.4"><path d="M6 2h8l4 4v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z" fill="#E9EFFD"/><path d="M14 2v4h4"/></svg>
       <div class="dz-t">点击选择 PDF / DWG / DXF，或把文件拖到这里</div>
-      <div class="dz-s">支持 PDF、AutoCAD DWG、DXF · 建议单张系统图一个文件</div>
+      <div class="dz-s">支持 PDF、AutoCAD DWG、DXF · 建议单张系统图一个文件 · 自动归入对应工程项目</div>
       <input type="file" id="startfile" accept=".pdf,.dwg,.dxf,application/pdf" multiple hidden>
     </div>
     <div class="startbtn">
-      <button class="btn ghost" onclick="hideStart()">先看看已有项目</button>
+      <button class="btn ghost" onclick="hideStart();navGo('projects')">先看看已有项目</button>
     </div>
     <div class="mut2" style="font-size:11.5px;text-align:center;margin-top:14px" id="startcfg"></div>
   </div>
