@@ -90,6 +90,28 @@ class ExportGateTests(unittest.TestCase):
         self.assertIn("RCBO 数量截断未能确认", text)
         self.assertIn("2SAL2", text)
 
+    def test_前端导出不得只依赖程序化blob下载(self):
+        """回归：导出主路径必须是真实 <a href> 导航式下载。
+
+        曾经用 fetch+blob+程序化 click，在内嵌浏览器里会被静默吞掉——用户看到的就是
+        「点了导出没有任何反应」，既不报错也没有文件。导航式下载走浏览器自己的下载管理器，
+        兼容性最好；这里用静态断言锁住，别被改回去。
+        """
+        import pathlib as _p
+        js = (_p.Path(__file__).resolve().parent.parent.parent / "frontend" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("function triggerDownload", js)
+        self.assertIn("function exportUrl", js)
+        # 导出面板的主按钮必须是 <a href> 而不是 button + onclick
+        self.assertIn('id="expok" href=', js)
+        # 主路径不得再自己造 blob：单据导出走真实链接，才能被浏览器下载管理器接管
+        do_export_body = js.split("async function doExport()", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("createObjectURL", do_export_body, "单据导出不应再用 blob 下载")
+        self.assertIn("exportUrl(", do_export_body)
+        self.assertIn("triggerDownload(", do_export_body)
+        # 必须保留手动兜底入口
+        self.assertIn("renderExportFallback", js)
+        self.assertIn("expfallback", js)
+
     def test_job_id_非法字符_400(self):
         for bad in ["..", "a/b", "a b", "a$b", "", "x" * 65]:
             with self.assertRaises(Exception, msg=f"job_id={bad!r} 应被拒绝"):

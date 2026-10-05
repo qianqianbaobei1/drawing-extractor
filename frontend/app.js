@@ -2651,6 +2651,33 @@ async function undoLastChange() {
 
 /* ===================== 导出 ===================== */
 
+/** 带 token 的导出地址：接口的租户中间件认 ?token=，所以真实链接也能过鉴权。 */
+function exportUrl(path) {
+  const params = new URLSearchParams();
+  if (Auth.token) params.set('token', Auth.token);
+  const qs = params.toString();
+  return qs ? `${path}${path.includes('?') ? '&' : '?'}${qs}` : path;
+}
+
+/** 用真实 <a href> 触发下载。
+ *
+ * 为什么不用 fetch + blob：内嵌浏览器（webview / iframe 里的应用）会把
+ * 程序化创建的 blob: 下载静默吞掉——点下去完全没反应，也不报错，没有任何提示。
+ * 交给浏览器自己做导航式下载，走的是它的下载管理器，兼容性最好。
+ * 返回该 <a>，调用方可以把它塞进界面当可见的兜底入口。
+ */
+function triggerDownload(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  if (filename) a.download = filename;
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 0);
+  return a;
+}
+
 function openExport() {
   if (!S.jobId) { toast('先打开一份图纸'); return; }
   const un = unresolved().length;
@@ -2717,6 +2744,11 @@ function openExport() {
 
   // 导出永远只有一条主路径：点下去就下载。存疑项不遮挡交付，
   // 「AI 复核后导出」「一键确认后导出」只是可选的数据质量快捷方式，不是前置条件。
+  //
+  // 主按钮用真实 <a href> 而不是 JS 触发：内嵌浏览器会把 blob 下载静默吞掉，
+  // 用户看到的就是「点了没反应」。导航式下载交给浏览器自己的下载管理器，最可靠。
+  const brand = S.targetBrand || defaultTargetBrand() || '';
+  const excelHref = exportUrl(`/api/jobs/${S.jobId}/excel${brand ? `?target_brand=${encodeURIComponent(brand)}` : ''}`);
   const mactions = document.querySelector('#expmodal .mactions');
   if (mactions) {
     mactions.innerHTML = `
@@ -2725,10 +2757,15 @@ function openExport() {
         <button class="linklike" style="margin-right:12px" onclick="triggerAiReviewAndExport()"
                 title="让 AI 全盘复核待核对项，复核完自动下载；没有把握的项会保留在 Excel 待核对区">🤖 AI 复核后导出</button>
         <button class="linklike" style="margin-right:12px" onclick="resolveAllAndExport()"
-                title="把剩余 ${un} 处待核对项标记为已确认再导下载">✅ 一键确认后导出</button>` : ''}
-      <button class="btn primary sm" id="expok" onclick="doExport()">${un > 0 ? `直接导出（含 ${un} 处待核对）` : '确认导出'}</button>
+                title="把剩余 ${un} 处待核对项标记为已确认后再下载">✅ 一键确认后导出</button>` : ''}
+      <a class="btn primary sm" id="expok" href="${esc(excelHref)}" download
+         onclick="markExportStarted()"
+      >${un > 0 ? `直接导出（含 ${un} 处待核对）` : '确认导出'}</a>
     `;
   }
+  // 兜底入口：某些内嵌浏览器连导航式下载也拦，那就给一个能右键/"在新窗口打开"的明文链接。
+  // 弹窗不再自动关闭——关掉就等于把唯一的兜底入口也关掉了。
+  renderExportFallback(excelHref);
   $('expmodal').classList.add('show');
 }
 
@@ -2736,37 +2773,62 @@ function closeExport() {
   $('expmodal').classList.remove('show');
 }
 
+/** 点击导出后就地反馈，便于用户判断"到底有没有开始下载"。 */
+function markExportStarted() {
+  const fb = $('expfallback');
+  if (fb) {
+    fb.insertAdjacentHTML('afterbegin',
+      '<div style="color:var(--ok,#178A4C);font-weight:600;margin-bottom:4px">'
+      + '✓ 已发起下载。若浏览器没有任何反应（内嵌浏览器常会拦下载），用下面的链接手动取文件。</div>');
+  }
+}
+
+/** 导出兜底入口：真实链接 + 新窗口打开 + 提示可右键另存。 */
+function renderExportFallback(href) {
+  const fb = $('expfallback');
+  if (!fb) return;
+  fb.innerHTML = `<span class="mut">下载没反应？</span>
+    <a href="${esc(href)}" download style="color:var(--acc-d);text-decoration:underline;margin:0 6px">点这里直接下载</a>
+    <span class="mut">或</span>
+    <a href="${esc(href)}" target="_blank" rel="noopener"
+       style="color:var(--acc-d);text-decoration:underline;margin-left:6px">在新窗口打开</a>
+    <span class="mut">（右键可「链接存储为」，也可复制链接到系统浏览器打开）</span>`;
+}
+
 async function doExport() {
+  if (!S.jobId) { toast('先打开一份图纸'); return; }
+  const brand = S.targetBrand || defaultTargetBrand() || '';
+  const url = exportUrl(`/api/jobs/${S.jobId}/excel${brand ? `?target_brand=${encodeURIComponent(brand)}` : ''}`);
+  // 先探一次状态码，好把“服务端真的做不出来”和“浏览器吞了下载”区分开
+  let status = 0;
   try {
     const headers = {};
     if (Auth.token) headers['Authorization'] = `Bearer ${Auth.token}`;
-    const res = await fetch(`/api/jobs/${S.jobId}/excel`, { headers });
-    if (res.status === 409) {
-      // 只有当 config/delivery.json 把 export_gate.block_unresolved_default 打开时才会走到这里
-      let n = '?';
-      try { const j = await res.json(); if (j && j.detail && j.detail.unresolved_count != null) n = j.detail.unresolved_count; } catch (e) {}
-      closeExport();
-      toast(`导出被拦下：还有 ${n} 处存疑未确认（该项目开启了导出前门禁）`);
-      addMsg('sys', `导出被拦截：还有 ${n} 处存疑未确认。当前项目开启了“存疑未清零不许导出”的门禁；`
-        + '逐项核对或用「一键确认后导出」即可，也可以让管理员关闭该门禁。');
-      return;
-    }
-    if (!res.ok) throw new Error('服务端没有生成 Excel');
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `配电箱元器件清单(报价用)-${S.jobId}.xlsx`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    closeExport();
-    addMsg('sys', `Excel 报价清单已下载（含 ${S.changes.length} 处修改记录）`);
-    toast('Excel 报价清单已开始下载');
+    status = (await fetch(url, { headers })).status;
   } catch (e) {
-    toast('导出失败：' + e.message);
+    toast('导出失败：连不上服务端'); return;
   }
+  if (status === 409) {
+    // 只有当 config/delivery.json 把 export_gate.block_unresolved_default 打开时才会走到这里
+    let n = '?';
+    try {
+      const headers = Auth.token ? { Authorization: `Bearer ${Auth.token}` } : {};
+      const j = await (await fetch(url, { headers })).json();
+      if (j?.detail?.unresolved_count != null) n = j.detail.unresolved_count;
+    } catch (e) {}
+    closeExport();
+    toast(`导出被拦下：还有 ${n} 处存疑未确认（该项目开启了导出前门禁）`);
+    addMsg('sys', `导出被拦截：还有 ${n} 处存疑未确认。当前项目开启了“存疑未清零不许导出”的门禁；`
+      + '逐项核对或用「一键确认后导出」即可，也可以让管理员关闭该门禁。');
+    return;
+  }
+  if (status !== 200) { toast(`导出失败：服务端返回 ${status}`); return; }
+
+  triggerDownload(url, `配电箱元器件清单(报价用)-${S.jobId}.xlsx`);
+  renderExportFallback(url);
+  markExportStarted();
+  addMsg('sys', `Excel 报价清单已开始下载（含 ${S.changes.length} 处修改记录）`);
+  toast('已发起下载；若没反应，用导出面板里的「点这里直接下载」');
 }
 
 /* ===================== 框选解析 ===================== */
@@ -3314,14 +3376,11 @@ async function exportAiTable(tableId) {
     });
     if (!res.ok) throw new Error('导出失败 (HTTP ' + res.status + ')');
     const blob = await res.blob();
+    // 自定义表格是 POST 生成、拿不到可直接导航的地址，只能走 blob；
+    // 内嵌浏览器若吞掉这次下载，用下面的新窗口链接兜底（blob 地址在新窗口同样可下）。
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${t.title || '数据整理表'}.xlsx`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    triggerDownload(url, `${t.title || '数据整理表'}.xlsx`);
+    setTimeout(() => URL.revokeObjectURL(url), 20000);
     toast('✅ 自定义 Excel 报表已下载！');
   } catch (e) {
     toast('导出失败：' + e.message);
