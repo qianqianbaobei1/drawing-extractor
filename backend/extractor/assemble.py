@@ -195,21 +195,30 @@ def build_distribution_topology(boxes: list[Box], circuits: list[Circuit]) -> li
         circuits_by_box[c.box].append(c)
 
     # 2. 判定箱体类别 (cabinet: 一级总柜, box: 二级分箱, secondary: 二次控制原理图)
-    # 严格采用国家标准电气柜型与盘柜代号正则，彻底废除 loose substring 与误伤极高的 DT(电梯)/AA 等盲目特判
-    CABINET_CODE_RE = re.compile(r"^(?:\d+)?(?:AA|ALZ|APZ|ZAP|GGD|MNS|GCK|GCS)(?:\d+)?$", re.IGNORECASE)
-    CABINET_NAME_PATTERNS = ("总配电", "动力总", "进线柜", "变压器出线", "低压配电屏", "主配", "总箱", "母线联络")
-    SECONDARY_PATTERNS = ("二次", "控制原理", "控制电路", "原理图", "二次接线")
+    # 规则由 config/domain.json 中的 topology 段驱动，保留标准电气柜型与盘柜代号正则兜底
+    _TOPOLOGY_CFG = _DOMAIN.get("topology") or {}
+    _CAB_CODE_REGEXES = [
+        re.compile(p, re.IGNORECASE)
+        for p in _TOPOLOGY_CFG.get("cabinet_code_regexes", [
+            r"^(?:\d+)?(?:AA|ALZ|APZ|ZAP|GGD|MNS|GCK|GCS)(?:\d+)?$",
+            r"^(?:[0-9A-Z]+)?(?:AL|AP)Z(?:\d+)?$",
+        ])
+    ]
+    _CAB_NAME_PATTERNS = tuple(_TOPOLOGY_CFG.get("cabinet_name_patterns", (
+        "总配电", "动力总", "进线柜", "变压器出线", "低压配电屏", "主配", "总箱", "母线联络"
+    )))
+    _SEC_PATTERNS = tuple(_TOPOLOGY_CFG.get("secondary_patterns", (
+        "二次", "控制原理", "控制电路", "原理图", "二次接线"
+    )))
 
     def _judge_type(box: Box) -> str:
         name = box.name or ""
         code = (box.code or "").strip()
-        if any(p in name for p in SECONDARY_PATTERNS):
+        if any(p in name for p in _SEC_PATTERNS):
             return "secondary"
-        if any(p in name for p in CABINET_NAME_PATTERNS):
+        if any(p in name for p in _CAB_NAME_PATTERNS):
             return "cabinet"
-        if CABINET_CODE_RE.match(code):
-            return "cabinet"
-        if re.search(r"^(?:[0-9A-Z]+)?(?:AL|AP)Z(?:\d+)?$", code, re.IGNORECASE):
+        if any(rgx.search(code) for rgx in _CAB_CODE_REGEXES):
             return "cabinet"
         return "box"
 

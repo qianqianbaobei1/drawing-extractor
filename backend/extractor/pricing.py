@@ -30,7 +30,18 @@ COPPER_PRICE_UPDATED = str(_P_COPPER.get("price_updated") or "")
 AUXILIARY_RATE = float(_P_RATES["auxiliary_rate"])
 LABOR_OUTGOING_RATE = float(_P_RATES["labor_outgoing"])
 LABOR_INCOMING_RATE = float(_P_RATES["labor_incoming"])
+PROFIT_RATE_DEFAULT = float(_P_RATES.get("profit_rate", 0.08))
+TAX_RATE_DEFAULT = float(_P_RATES.get("tax_rate", 0.13))
+TEST_CERT_RATE = float(_P_RATES.get("test_cert_rate", 0.02))
+DEFAULT_LIST_PRICE_RATIO = float(_P_RATES.get("default_list_price_ratio", 0.4))
 AB_RATES = _P_RATES["ab"]
+
+_ENCLOSURE_CFG = _PRICING.get("enclosure", {})
+HEM_WH = float(_ENCLOSURE_CFG.get("hem_wh_mm", 50.0))
+HEM_D = float(_ENCLOSURE_CFG.get("hem_d_mm", 20.0))
+IP_PREMIUMS = dict(_ENCLOSURE_CFG.get("ip_premiums", {"IP55": 1.35, "IP65": 1.35, "IP44": 1.15}))
+THICKNESS_DEFAULTS = dict(_ENCLOSURE_CFG.get("thickness_defaults", {"plastic": 1.2, "heavy_floor": 2.0, "small_box": 1.2, "default": 1.5}))
+CIRCUIT_TIER_PRICES = list(_ENCLOSURE_CFG.get("circuit_tier_prices", []))
 
 BRAND_ALIAS = dict(_PRICING["brand_alias"])
 BRAND_TIERS = dict(_PRICING["brand_tiers"])
@@ -437,7 +448,7 @@ def calculate_component_unit_price(
     )
     if matched_lib:
         cost_p = round(matched_lib["price_tax"], 2)
-        list_p = round(matched_lib["list_price"], 2) if matched_lib["list_price"] > 0 else round(cost_p / 0.4, 2)
+        list_p = round(matched_lib["list_price"], 2) if matched_lib["list_price"] > 0 else round(cost_p / DEFAULT_LIST_PRICE_RATIO, 2)
         code = matched_lib["code"]
         b_name = matched_lib["brand"]
         m_name = matched_lib["model"]
@@ -519,8 +530,8 @@ def calc_enclosure_unfolding(
       封板价格 = 封板面积(m²) × 封板材料单价
       总价     = 底面价 + 四周价 + 门价 + 封板价
     """
-    hem_wh = 50.0  # 宽/高折边 mm
-    hem_d = 20.0   # 深度折边 mm
+    hem_wh = HEM_WH  # 宽/高折边 mm，来自 config/pricing.json
+    hem_d = HEM_D   # 深度折边 mm，来自 config/pricing.json
     coef_a = A if A is not None else TYPE_A.get(box_type, 2.0)
 
     # 查取材料加工单价 (元/m²)
@@ -635,13 +646,13 @@ def resolve_box_enclosure_specs(box: dict, w: float, h: float, d: float, is_floo
 
     if thickness is None:
         if material == "塑料面板（PC料，阻燃）":
-            thickness = 1.2
+            thickness = float(THICKNESS_DEFAULTS.get("plastic", 1.2))
         elif is_floor or max(w, h) >= 1600:
-            thickness = 2.0
+            thickness = float(THICKNESS_DEFAULTS.get("heavy_floor", 2.0))
         elif max(w, h) <= 450:
-            thickness = 1.2
+            thickness = float(THICKNESS_DEFAULTS.get("small_box", 1.2))
         else:
-            thickness = 1.5
+            thickness = float(THICKNESS_DEFAULTS.get("default", 1.5))
 
     # 3. 动态解析箱体/柜体内部钣金结构 (b_type)
     # 彻底杜绝写死“安装板”：支持立板、立板+支架、安装立板、双门、横梁、空箱等通用工业结构
@@ -705,16 +716,23 @@ def estimate_box_enclosure_price(box: dict, circuits_count: int) -> Tuple[float,
         unfold = calc_enclosure_unfolding(w, h, d, box_type=b_type, material=material, thickness=thk)
         price = unfold["total_price"]
         desc = unfold["desc"]
-        if "IP55" in ip or "IP65" in ip:
-            price = round(price * 1.35, 2)
-            desc += " [高防护密封处理]"
-        elif "IP44" in ip:
-            price = round(price * 1.15, 2)
-            desc += " [防溅檐边处理]"
+        for ip_prefix, prem in IP_PREMIUMS.items():
+            if ip_prefix in ip:
+                price = round(price * float(prem), 2)
+                desc += f" [{ip_prefix}高防护处理]"
+                break
         return price, desc
 
     # 2. 传统定额规则兜底（未注物理尺寸时，严禁假装实测尺寸，如实标明显式估算基准）
-    if is_floor or circuits_count > 24:
+    tier_found = None
+    for tier in CIRCUIT_TIER_PRICES:
+        if circuits_count >= tier.get("min_circuits", 0):
+            tier_found = tier
+            break
+    if tier_found:
+        base_price = float(tier_found["price"])
+        model_desc = tier_found["desc"].format(circuits_count=circuits_count)
+    elif is_floor or circuits_count > 24:
         base_price = 1450.0  # 落地动力柜 / GGD / XL-21
         model_desc = f"落地式配电柜外壳（估算:按{circuits_count}回路定额推导，GGD/XL-21参考800x1800x600 2.0mm，待核定）"
     elif circuits_count > 12:
@@ -727,12 +745,11 @@ def estimate_box_enclosure_price(box: dict, circuits_count: int) -> Tuple[float,
         base_price = 220.0   # 微型控制箱
         model_desc = f"小型端子/控制箱外壳（估算:按{circuits_count}回路定额推导，参考300x400x160 1.2mm，待核定）"
 
-    if "IP55" in ip or "IP65" in ip:
-        base_price *= 1.35
-        model_desc += " [高防护密封条处理]"
-    elif "IP44" in ip:
-        base_price *= 1.15
-        model_desc += " [带防溅防尘檐边]"
+    for ip_prefix, prem in IP_PREMIUMS.items():
+        if ip_prefix in ip:
+            base_price = round(base_price * float(prem), 2)
+            model_desc += f" [{ip_prefix}高防护处理]"
+            break
 
     return round(base_price, 2), model_desc
 
@@ -752,7 +769,9 @@ def estimate_copper_busbar_cost(main_current_a: int, box_width_m: float = 0.8) -
 
     _, spec_code, weight_per_m = matched_spec
     # 三相主母线(3根) + N排(1根) + PE地排(1根)
-    total_length_m = (box_width_m + 0.4) * 3 + (box_width_m + 0.2) * 2
+    allow_main = float(DEFAULTS.get("busbar_allowance_main_m", 0.4))
+    allow_pe_n = float(DEFAULTS.get("busbar_allowance_pe_n_m", 0.2))
+    total_length_m = (box_width_m + allow_main) * 3 + (box_width_m + allow_pe_n) * 2
     total_weight_kg = round(total_length_m * weight_per_m, 2)
     busbar_cost = round(total_weight_kg * COPPER_PRICE_PER_KG, 2)
     detail = f"主线电流{main_current_a}A 选用[{spec_code}] 重量{total_weight_kg}kg@￥{COPPER_PRICE_PER_KG}/kg"
@@ -828,8 +847,8 @@ def calculate_box_quotation(
     circuits: list[dict],
     components: list[dict],
     brand: str = "",
-    profit_rate: float = 0.08,
-    tax_rate: float = 0.13,
+    profit_rate: Optional[float] = None,
+    tax_rate: Optional[float] = None,
     use_ab_model: bool = False,
     ab_mode: str = "auto"
 ) -> dict:
@@ -925,14 +944,16 @@ def calculate_box_quotation(
     outgoing_count = max(0, circuits_count - incoming_count)
     labor_cost = round(incoming_count * LABOR_INCOMING_RATE + outgoing_count * LABOR_OUTGOING_RATE, 2)
 
-    # 6. 型式试验与CCC分摊 (一般按出厂价 2%)
+    # 6. 型式试验与CCC分摊 (一般按出厂价分摊，费率来自 config/pricing.json)
     factory_cost = enclosure_cost + comp_total + busbar_cost + auxiliary_cost + labor_cost
-    test_cert_cost = round(factory_cost * 0.02, 2)
+    test_cert_cost = round(factory_cost * TEST_CERT_RATE, 2)
 
     # 7. 制造总成本与传统含税出厂报价
+    p_rate = profit_rate if profit_rate is not None else PROFIT_RATE_DEFAULT
+    t_rate = tax_rate if tax_rate is not None else TAX_RATE_DEFAULT
     total_cost = factory_cost + test_cert_cost
-    subtotal_with_profit = total_cost * (1.0 + profit_rate)
-    trad_tax_included = round(subtotal_with_profit * (1.0 + tax_rate), 2)
+    subtotal_with_profit = total_cost * (1.0 + p_rate)
+    trad_tax_included = round(subtotal_with_profit * (1.0 + t_rate), 2)
 
     # 8. 行业标准 A/B 费率定额模型计算 (造价极客标准六步法)
     is_jv = (norm_brand(brand) in JOINT_VENTURE_BRANDS) if ab_mode == "auto" else (ab_mode == "joint-venture")
@@ -988,8 +1009,8 @@ def calculate_box_quotation(
             "factory_total_cost": round(total_cost, 2),
         },
         "ab_quotation": ab_quotation,
-        "profit_rate": profit_rate,
-        "tax_rate": tax_rate,
+        "profit_rate": p_rate,
+        "tax_rate": t_rate,
         "final_tax_included": final_price,
         "components": priced_components,
     }

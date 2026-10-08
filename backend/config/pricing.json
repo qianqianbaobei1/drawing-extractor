@@ -1,7 +1,10 @@
 {
   "_comment": "报价口径。铜价、工时、费率、品牌系数、兜底面价与钣金定额。全部可按项目/行情覆盖。",
   "_env": {
-    "COPPER_PRICE_PER_KG": "copper.price_per_kg"
+    "COPPER_PRICE_PER_KG": "copper.price_per_kg",
+    "PROFIT_RATE": "rates.profit_rate",
+    "TAX_RATE": "rates.tax_rate",
+    "TEST_CERT_RATE": "rates.test_cert_rate"
   },
   "copper": {
     "price_per_kg": 76.5,
@@ -13,6 +16,10 @@
     "auxiliary_rate": 0.065,
     "labor_outgoing": 45.0,
     "labor_incoming": 120.0,
+    "profit_rate": 0.08,
+    "tax_rate": 0.13,
+    "test_cert_rate": 0.02,
+    "default_list_price_ratio": 0.4,
     "ab": {
       "joint-venture": {
         "A": 0.12,
@@ -428,10 +435,53 @@
     "benchmark_brand": "施耐德",
     "domestic_substitute": "正泰"
   },
+  "enclosure": {
+    "hem_wh_mm": 50.0,
+    "hem_d_mm": 20.0,
+    "ip_premiums": {
+      "IP55": 1.35,
+      "IP65": 1.35,
+      "IP44": 1.15
+    },
+    "thickness_defaults": {
+      "plastic": 1.2,
+      "heavy_floor": 2.0,
+      "small_box": 1.2,
+      "default": 1.5
+    },
+    "circuit_tier_prices": [
+      {
+        "min_circuits": 25,
+        "price": 1450.0,
+        "is_floor": true,
+        "desc": "落地式配电柜外壳（估算:按{circuits_count}回路定额推导，GGD/XL-21参考800x1800x600 2.0mm，待核定）"
+      },
+      {
+        "min_circuits": 13,
+        "price": 580.0,
+        "is_floor": false,
+        "desc": "挂墙式配电箱外壳（估算:按{circuits_count}回路定额推导，参考600x800x200 1.5mm，待核定）"
+      },
+      {
+        "min_circuits": 7,
+        "price": 360.0,
+        "is_floor": false,
+        "desc": "明装照明配电箱外壳（估算:按{circuits_count}回路定额推导，参考400x500x180 1.2mm，待核定）"
+      },
+      {
+        "min_circuits": 0,
+        "price": 220.0,
+        "is_floor": false,
+        "desc": "小型端子/控制箱外壳（估算:按{circuits_count}回路定额推导，参考300x400x160 1.2mm，待核定）"
+      }
+    ]
+  },
   "defaults": {
     "_comment": "图纸未标注时的工程默认尺寸（仅用于量级估算，均会标注来源）。",
     "busbar_length_m": 12.0,
     "box_width_m": 0.8,
+    "busbar_allowance_main_m": 0.4,
+    "busbar_allowance_pe_n_m": 0.2,
     "enclosure_thickness_mm": 1.5
   }
 }

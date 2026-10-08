@@ -868,8 +868,22 @@ def _load_from_xlsx(job_id: str):
         legacy_meta: dict = {}
         filename = f"{job_id}.pdf"
 
-        if "箱体清单" in wb.sheetnames:
-            ws = wb["箱体清单"]
+        sheet_cfg = _DELIVERY.get("sheets") or {}
+        sheet_boxes = sheet_cfg.get("boxes", "箱体清单")
+        sheet_comps = sheet_cfg.get("components", "元器件汇总")
+        sheet_circs = sheet_cfg.get("circuits", "回路明细")
+        sheet_reqs = sheet_cfg.get("requirements", "技术要求与报价说明")
+
+        def _get_sheet(name_pref: str, fallback: str):
+            if name_pref in wb.sheetnames:
+                return wb[name_pref]
+            if fallback in wb.sheetnames:
+                return wb[fallback]
+            return None
+
+        ws_boxes = _get_sheet(sheet_boxes, "箱体清单")
+        if ws_boxes is not None:
+            ws = ws_boxes
             rows = list(ws.iter_rows(values_only=True))
             if len(rows) > 1 and rows[1] and rows[1][0] and "依据:" in str(rows[1][0]):
                 subtitle = str(rows[1][0])
@@ -899,8 +913,9 @@ def _load_from_xlsx(job_id: str):
                         "quantity": int(r[7] or 1) if str(r[7] or "").isdigit() else 1,
                         "note": str(r[8] or "")
                     })
-        if "元器件汇总" in wb.sheetnames:
-            ws = wb["元器件汇总"]
+        ws_comps = _get_sheet(sheet_comps, "元器件汇总")
+        if ws_comps is not None:
+            ws = ws_comps
             rows = list(ws.iter_rows(values_only=True))
             if len(rows) > 3:
                 for r in rows[3:]:
@@ -914,8 +929,9 @@ def _load_from_xlsx(job_id: str):
                         "used_in": str(r[5] or ""),
                         "note": str(r[6] or "")
                     })
-        if "回路明细" in wb.sheetnames:
-            ws = wb["回路明细"]
+        ws_circs = _get_sheet(sheet_circs, "回路明细")
+        if ws_circs is not None:
+            ws = ws_circs
             rows = list(ws.iter_rows(values_only=True))
             if len(rows) > 3:
                 for r in rows[3:]:
@@ -937,8 +953,9 @@ def _load_from_xlsx(job_id: str):
                         "start_method": str(r[13] or ""),
                         "note": str(r[14] or "")
                     })
-        if "技术要求与报价说明" in wb.sheetnames:
-            ws = wb["技术要求与报价说明"]
+        ws_reqs = _get_sheet(sheet_reqs, "技术要求与报价说明")
+        if ws_reqs is not None:
+            ws = ws_reqs
             rows = list(ws.iter_rows(values_only=True))
             if len(rows) > 3:
                 for r in rows[3:]:

@@ -5,7 +5,12 @@
     "VISION_MAX_RETRIES": "transport.max_retries",
     "VISION_TEMPERATURE": "generation.temperature",
     "VISION_CONCURRENCY": "transport.concurrency",
-    "VISION_MAX_TOKENS": "generation.max_tokens"
+    "VISION_MAX_TOKENS": "generation.max_tokens",
+    "VISION_REGION_MAX_TOKENS": "generation.region_review.max_tokens",
+    "ASSISTANT_MAX_TOKENS": "assistant.max_tokens",
+    "ASSISTANT_ATTEMPTS": "assistant.attempts",
+    "ASSISTANT_TIMEOUT_S": "assistant.timeout_s",
+    "ASSISTANT_HISTORY_TURNS": "assistant.history_turns"
   },
   "transport": {
     "timeout_s": 300,
@@ -20,7 +25,17 @@
     "seed": null,
     "detail": "high",
     "force_json": true,
-    "max_tokens": 8192
+    "max_tokens": 8192,
+    "region_review": {
+      "max_tokens": 2500,
+      "temperature": 0.0
+    }
+  },
+  "assistant": {
+    "max_tokens": 4000,
+    "attempts": 2,
+    "timeout_s": 120,
+    "history_turns": 6
   },
   "parse_gate": {
     "required_sections": [

@@ -34,3 +34,4 @@ backend/data/*.csv
 *.dwg
 *.dxf
 *.log
+deliveries/

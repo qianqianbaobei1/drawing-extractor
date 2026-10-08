@@ -502,5 +502,28 @@
       "^图\\d+$"
     ],
     "fallback_project_name": ""
+  },
+  "topology": {
+    "cabinet_code_regexes": [
+      "^(?:\\d+)?(?:AA|ALZ|APZ|ZAP|GGD|MNS|GCK|GCS)(?:\\d+)?$",
+      "^(?:[0-9A-Z]+)?(?:AL|AP)Z(?:\\d+)?$"
+    ],
+    "cabinet_name_patterns": [
+      "总配电",
+      "动力总",
+      "进线柜",
+      "变压器出线",
+      "低压配电屏",
+      "主配",
+      "总箱",
+      "母线联络"
+    ],
+    "secondary_patterns": [
+      "二次",
+      "控制原理",
+      "控制电路",
+      "原理图",
+      "二次接线"
+    ]
   }
 }

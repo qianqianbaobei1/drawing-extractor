@@ -8,8 +8,10 @@ import json
 import os
 import urllib.error
 
+from .config import vision as _vision_config
 from .vision import post_chat
 
+_AST_CFG = _vision_config().get("assistant") or {}
 CONTRACT_VERSION = "1.0"
 
 EDITABLE_FIELDS = ("phase", "breaker", "cable", "power_kw", "load_name")
@@ -38,8 +40,10 @@ def _prompt_path() -> str:
 class Assistant:
     """复用视觉模型的接口配置，模型名可用 ASSISTANT_MODEL 单独覆盖。"""
 
-    MAX_TOKENS = 4000   # 2000 太紧：推理型模型偶发会把预算全花在推理上，content 直接空
-    ATTEMPTS = 2        # 空响应多半是服务端偶发，重试一次基本能过
+    MAX_TOKENS = int(_AST_CFG.get("max_tokens") or 4000)   # 2000 太紧：推理型模型偶发会把预算全花在推理上，content 直接空
+    ATTEMPTS = int(_AST_CFG.get("attempts") or 2)        # 空响应多半是服务端偶发，重试一次基本能过
+    TIMEOUT_S = int(_AST_CFG.get("timeout_s") or 120)
+    HISTORY_TURNS = int(_AST_CFG.get("history_turns") or 6)
 
     def __init__(self):
         self.api_key = os.environ.get("ASSISTANT_API_KEY") or os.environ.get("VISION_API_KEY", "")
@@ -57,15 +61,21 @@ class Assistant:
     def configured(self) -> bool:
         return bool(self.api_key and self.base_url and self.model)
 
+    @property
+    def is_deepseek(self) -> bool:
+        base = (self.base_url or "").lower()
+        model = (self.model or "").lower()
+        return "deepseek" in base or "deepseek" in model
+
     def _post(self, payload: dict) -> dict:
         try:
-            return post_chat(self.base_url, self.api_key, payload, timeout=120)
+            return post_chat(self.base_url, self.api_key, payload, timeout=self.TIMEOUT_S)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode(errors="ignore")
             # 部分兼容接口不支持强制 JSON 输出，去掉再试一次
             if exc.code == 400 and "response_format" in body:
                 payload.pop("response_format", None)
-                return post_chat(self.base_url, self.api_key, payload, timeout=120)
+                return post_chat(self.base_url, self.api_key, payload, timeout=self.TIMEOUT_S)
             raise RuntimeError(f"助手模型调用失败(HTTP {exc.code}): {body[:300]}") from exc
 
     def ask(self, context: dict, message: str, history: list[dict] | None = None) -> dict:
@@ -85,7 +95,7 @@ class Assistant:
             {"role": "system", "content": secure_system_prompt},
             {"role": "user", "content": f"<engineering_drawing_context>\n{context_str}\n</engineering_drawing_context>\n以上为当前工程图纸提取数据事实。"},
         ]
-        for turn in (history or [])[-6:]:
+        for turn in (history or [])[-self.HISTORY_TURNS:]:
             role = turn.get("role")
             if role in ("user", "assistant") and turn.get("content"):
                 messages.append({"role": role, "content": str(turn["content"])})
@@ -98,7 +108,7 @@ class Assistant:
             "max_tokens": self.MAX_TOKENS,
             "temperature": self.temperature,
         }
-        if self.base_url.startswith("https://api.deepseek.com"):
+        if self.is_deepseek:
             payload["thinking"] = {"type": "disabled"}
 
         failure = "未拿到任何响应"

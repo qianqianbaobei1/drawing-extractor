@@ -24,6 +24,7 @@ from .schema import (Box, Circuit, ExtraDevice, RawExtraction, Requirement, Unce
 _VISION = _vision_config()
 _TRANSPORT = _VISION["transport"]
 _GENERATION = _VISION["generation"]
+_REGION_REVIEW = _GENERATION.get("region_review") or {"max_tokens": 2500, "temperature": 0.0}
 _PARSE_GATE = _VISION["parse_gate"]
 
 REQUIRED_SECTIONS = set(_PARSE_GATE["required_sections"])
@@ -363,6 +364,11 @@ class VisionProvider:
     def configured(self) -> bool:
         return bool(self.api_key)
 
+    def _is_deepseek(self) -> bool:
+        base = (self.base_url or "").lower()
+        model = (self.model or "").lower()
+        return "deepseek" in base or "deepseek" in model
+
     def _call(self, payload: dict) -> dict:
         self.api_call_attempts += 1
         return post_chat(self.base_url, self.api_key, payload)
@@ -552,7 +558,7 @@ class VisionProvider:
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
-        if self.base_url.startswith("https://api.deepseek.com"):
+        if self._is_deepseek():
             payload["thinking"] = {"type": "disabled"}
         else:
             # DeepSeek 未将 seed 列为支持参数，其他兼容接口才发送
@@ -665,10 +671,10 @@ class VisionProvider:
                 ]},
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": 2500,
-            "temperature": 0.0,
+            "max_tokens": int(_REGION_REVIEW.get("max_tokens") or 2500),
+            "temperature": float(_REGION_REVIEW.get("temperature", 0.0)),
         }
-        if self.base_url.startswith("https://api.deepseek.com"):
+        if self._is_deepseek():
             payload["thinking"] = {"type": "disabled"}
 
         try:
