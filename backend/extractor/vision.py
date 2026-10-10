@@ -18,6 +18,7 @@ import socket
 from urllib.parse import urlparse
 
 from .config import vision as _vision_config
+from .panel_release import UNCONFIRMED_QTY_NOTE
 from .schema import (Box, Circuit, ExtraDevice, RawExtraction, Requirement, Uncertainty)
 
 # 调用参数与解析门禁全部来自 config/vision.json
@@ -569,12 +570,20 @@ class VisionProvider:
         return raw
 
     def _stamp(self, raw: RawExtraction, page: int, clip: dict | None) -> None:
-        """把块坐标折回整页，并写上页码。模型并不知道自己被喂的是哪一块。"""
+        """把块坐标折回整页，并写上页码。模型并不知道自己被喂的是哪一块。
+
+        视觉模型不能自己证明台数。箱体数量先按单箱候选留下，等人在清单里改过再放行。
+        """
         for item in list(raw.circuits) + list(raw.uncertainties):
             if item.bbox is None:
                 continue
             item.bbox = _clip_to_page(item.bbox, clip)
             item.bbox.page = page
+        for box in raw.boxes:
+            box.quantity_confirmed = False
+            note = box.note or ""
+            if UNCONFIRMED_QTY_NOTE not in note:
+                box.note = f"{note}；{UNCONFIRMED_QTY_NOTE}" if note else UNCONFIRMED_QTY_NOTE
 
     def _call_with_repair(self, payload: dict) -> RawExtraction:
         """调用并用格式修复重试；重试次数来自 config/vision.json 的 parse_gate.json_repair_attempts。"""

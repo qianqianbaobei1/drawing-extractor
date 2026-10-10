@@ -82,6 +82,31 @@ class TestEvidenceAndCatalogReconciler(unittest.TestCase):
         multi = expand_panel_range("1AL1, 1AL2, 2AP1")
         self.assertEqual(multi, ["1AL1", "1AL2", "2AP1"])
 
+        # 并排箱保持整段；斜杠分隔的完整箱号仍拆开
+        self.assertEqual(
+            expand_panel_range("3~10RDAL"),
+            ["3RDAL", "4RDAL", "5RDAL", "6RDAL", "7RDAL", "8RDAL", "9RDAL", "10RDAL"],
+        )
+        self.assertEqual(expand_panel_range("AW1/2/3/4-CDZ 单相电表箱"), ["AW1/2/3/4-CDZ"])
+        self.assertEqual(expand_panel_range("AP1/AP2/AP3"), ["AP1", "AP2", "AP3"])
+        self.assertIsNone(DrawingCatalogReconciler.parse_catalog_line("1AK1"))
+        self.assertIsNotNone(DrawingCatalogReconciler.parse_catalog_line("9KX3 排风机控制箱"))
+
+        # 穿管、互感器精度级、双电源电流规格、电压、纯数字区间都不是箱号
+        for noise in (
+            "BV-3x2.5-PC20-WC，CC",
+            "WDZ-YJY-5x16-CT/PC50-WC,FC",
+            "分集水器控制面板与接线盒之间预留一根PC20管",
+            "600/5A*3 0.5/10P20",
+            "ATSE-63A",
+            "ATSE-63A/4P",
+            "AC220V",
+            "12~18",
+            "XLP000-25A",
+            "XLP000-25A/3P",
+        ):
+            self.assertEqual(expand_panel_range(noise), [], noise)
+
     def test_catalog_reconciliation_missing_jx(self):
         """模拟 JX1~JX21 漏柜场景：图纸目录声明存在，但提取结果完全未进流水线。"""
         catalog_lines = [

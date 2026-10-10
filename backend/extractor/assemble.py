@@ -12,6 +12,7 @@ from .schema import (
     Circuit,
     Component,
     DistributionNode,
+    BomRelease,
     Evidence,
     EvidenceType,
     ExtractionResult,
@@ -22,8 +23,16 @@ from .schema import (
     Uncertainty,
     MODEL_EVIDENCE_ORIGIN,
 )
+from .panel_release import (
+    INSTALLED_SPARE_NOTE,
+    UNCONFIRMED_QTY_WARNING,
+    box_multiplier,
+    material_gap_lines,
+    spare_disposition,
+)
 from .normalizer import parse_breaker, parse_cable
 from .config import delivery, domain
+from .cad_extractor import iter_panel_codes
 
 _DOMAIN = domain()
 _DELIVERY = delivery()
@@ -227,20 +236,37 @@ def build_distribution_topology(boxes: list[Box], circuits: list[Circuit]) -> li
     # 3. 关联上下级供电关系与二次控制挂接 (parent_map: child_code -> (parent_code, feed_circuit_no))
     parent_map: dict[str, tuple[str, str]] = {}
 
+    upstream_markers = tuple(_TOPOLOGY_CFG.get("upstream_unnamed_markers") or ())
+    link_template = _TOPOLOGY_CFG.get("link_pattern_template") or (
+        r"(?:^|至|送|往|引至|供|接|配电箱|\b){code}(?:配电箱|分箱|箱|柜|照明箱|动力箱|\b|$|\s)"
+    )
+
+    def _is_upstream(text: str) -> bool:
+        return any(marker in (text or "") for marker in upstream_markers)
+
     for src_code, src_circs in circuits_by_box.items():
         for c in src_circs:
-            search_text = f"{c.load_name} {c.note}".strip()
-            if not search_text:
-                continue
-            for target_code in all_boxes_dict:
-                if target_code == src_code or target_code in parent_map:
+            fields = [c.load_name or "", c.note or ""]
+            # 「由某箱引来」里的箱号是上级。不能再把它当成这条回路配出去的下级。
+            for field in fields:
+                if not _is_upstream(field) or src_code in parent_map:
                     continue
-                # 精准语义或词边界匹配箱体代号，如 "至 01AL1", "01AL1 配电箱", "送01AL2"；严禁无边界子串模糊匹配导致 AP1 误伤 AP10
-                pattern = rf"(?:^|至|送|往|引至|供|接|配电箱|\b){re.escape(target_code)}(?:配电箱|分箱|箱|柜|照明箱|动力箱|\b|$|\s)"
-                if re.search(pattern, search_text, re.IGNORECASE):
-                    parent_map[target_code] = (src_code, c.circuit_no)
-                    if box_types.get(src_code) != "secondary":
-                        box_types[src_code] = "cabinet"
+                for named in iter_panel_codes(field):
+                    if named != src_code and named in all_boxes_dict:
+                        parent_map[src_code] = (named, c.circuit_no)
+                        break
+            for field in fields:
+                if not field.strip() or _is_upstream(field):
+                    continue
+                for target_code in all_boxes_dict:
+                    if target_code == src_code or target_code in parent_map:
+                        continue
+                    # 精准语义或词边界匹配箱体代号，如 "至 01AL1", "01AL1 配电箱", "送01AL2"；严禁无边界子串模糊匹配导致 AP1 误伤 AP10
+                    pattern = link_template.replace("{code}", re.escape(target_code))
+                    if re.search(pattern, field, re.IGNORECASE):
+                        parent_map[target_code] = (src_code, c.circuit_no)
+                        if box_types.get(src_code) != "secondary":
+                            box_types[src_code] = "cabinet"
 
     # 处理二次控制图的编号关联（如 01AL2-2 挂接在 01AL2 下，或回路 secondary_ref 指向 01AL2-2）
     for code, b in all_boxes_dict.items():
@@ -306,17 +332,27 @@ def build_distribution_topology(boxes: list[Box], circuits: list[Circuit]) -> li
                 pass
         kw_str = f"{round(total_kw, 1)}kW" if total_kw > 0 else ""
 
+        note = box.note or (f"{box.size} {box.install}".strip())
+        parent_code = parent_map.get(code, ("", ""))[0]
+        if not parent_code:
+            unnamed = str(_TOPOLOGY_CFG.get("upstream_unnamed_note") or "")
+            parts = [box.note or ""] + [c.load_name or "" for c in circs] + [c.note or "" for c in circs]
+            marked = [part for part in parts if _is_upstream(part)]
+            named = any(iter_panel_codes(part) for part in marked)
+            if unnamed and marked and not named and unnamed not in note:
+                note = (note + "；" + unnamed).strip("；")
+
         return DistributionNode(
             id=f"node_{code}",
             code=code,
             name=box.name or "配电箱",
             node_type=node_t,
-            parent_code=parent_map.get(code, ("", ""))[0],
+            parent_code=parent_code,
             feed_circuit=feed_circuit,
             circuits_count=len(circs),
             power_kw=kw_str,
             children=child_nodes,
-            note=box.note or (f"{box.size} {box.install}".strip()),
+            note=note,
         )
 
     root_codes = [code for code in all_boxes_dict if code not in parent_map]
@@ -401,6 +437,24 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
                 exist.ip_rating = box.ip_rating
             if not exist.location and box.location:
                 exist.location = box.location
+            same_code_elsewhere = (
+                (exist.location or "").strip()
+                and (box.location or "").strip()
+                and exist.location.strip() != box.location.strip()
+            )
+            if same_code_elsewhere:
+                exist.quantity_confirmed = False
+                split_note = (
+                    f"{code}：同一箱号出现在不同安装位置"
+                    f"（{exist.location} / {box.location}），不能按箱号合并成确认总量"
+                )
+                if split_note not in warnings:
+                    warnings.append(split_note)
+            elif getattr(box, "quantity_confirmed", True) and not exist.quantity_confirmed:
+                exist.quantity = max(1, int(float(box.quantity or 1)))
+                exist.quantity_confirmed = True
+            elif not getattr(box, "quantity_confirmed", True):
+                exist.quantity_confirmed = False
 
     evidence_store: dict[str, Evidence] = dict(getattr(raw, "evidence_store", {}) or {})
 
@@ -569,15 +623,29 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
             row["notes"].append(note)
 
     for box in merged_boxes:
-        add("配电箱体", f"{box.code} {box.size}".strip(), _ESTIMATION["default_box_unit"], box.quantity,
-            box.code, "，".join(part for part in (box.ip_rating, box.install) if part))
+        box_qty, candidate_note = box_multiplier(box)
+        if candidate_note:
+            pending = f"{box.code}：{UNCONFIRMED_QTY_WARNING}"
+            if not any(box.code in item and "项目总量未放行" in item for item in warnings):
+                warnings.append(pending)
+        box_note = "，".join(part for part in (box.ip_rating, box.install, candidate_note) if part)
+        add("配电箱体", f"{box.code} {box.size}".strip(), _ESTIMATION["default_box_unit"], box_qty,
+            box.code, box_note)
 
     for circuit in circuits:
         box = boxes.get(circuit.box)
         if box is None or box.quantity <= 0:
             warnings.append(f"回路 {_circuit_label(circuit)}: 箱体 {circuit.box or '(未标注)'} 数量无法确认，未计入元器件汇总")
             continue
+        box_qty, candidate_note = box_multiplier(box)
         place = f"{circuit.box} {_circuit_label(circuit)}"
+        disposition = spare_disposition(circuit)
+        if disposition == "reserved":
+            warnings.append(
+                f"回路 {place}: 标明备用或预留，没有已安装器件规格，不计入采购数量"
+            )
+            continue
+        spare_note = INSTALLED_SPARE_NOTE if disposition == "installed_spare" else ""
         for field, name in (("breaker", ""), ("contactor", "交流接触器"),
                             ("ct", "电流互感器"), ("thermal", "热继电器")):
             value = getattr(circuit, field)
@@ -586,15 +654,17 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
                 # 宁可留一行“按原文计入、数量待确认”，也不能让这个器件从报价里消失：
                 # 漏一行是少算钱，留一行标记过的错数据只是要人工看一眼。
                 label = _breaker_name(value) if field == "breaker" else name
-                add(label, value.strip(), DEFAULT_DEVICE_UNIT, box.quantity, place, AS_WRITTEN)
+                pending_note = "；".join(part for part in (AS_WRITTEN, spare_note, candidate_note) if part)
+                add(label, value.strip(), DEFAULT_DEVICE_UNIT, box_qty, place, pending_note)
                 warnings.append(
                     f"回路 {place}: {label} 的写法“{value}”无法安全拆分，"
                     f"已按图纸原文计入 1 只/台箱体，数量待人工确认"
                 )
                 continue
             for spec, count in devices:
+                device_note = "；".join(part for part in (spare_note, candidate_note) if part)
                 add(_breaker_name(spec) if field == "breaker" else name,
-                    spec, DEFAULT_DEVICE_UNIT, count * box.quantity, place)
+                    spec, DEFAULT_DEVICE_UNIT, count * box_qty, place, device_note)
 
     seen_devices = set()
     dedup_devices = []
@@ -613,11 +683,16 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
             warnings.append(f"非回路设备 {device.name}: 规格未标注，已按原文计入，请补全规格后核对")
             continue
         quantity = device.quantity
+        device_note = device.note
         for box in merged_boxes:
-            if box.quantity > 1 and (device.used_in == box.code or device.used_in.startswith(box.code + " ")):
-                quantity *= box.quantity
+            if box.code and (device.used_in == box.code or device.used_in.startswith(box.code + " ")):
+                box_qty, candidate_note = box_multiplier(box)
+                if box_qty > 1:
+                    quantity *= box_qty
+                if candidate_note:
+                    device_note = f"{device_note}；{candidate_note}" if device_note else candidate_note
                 break
-        add(device.name, device.spec, device.unit, quantity, device.used_in, device.note)
+        add(device.name, device.spec, device.unit, quantity, device.used_in, device_note)
 
     order = {name: index for index, name in enumerate(CATEGORY_ORDER)}
     components = [
@@ -627,7 +702,14 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
             grouped.items(), key=lambda item: (order.get(item[0][0], len(order)), item[0][1], item[0][2])
         )
     ]
-    if len(merged_boxes) == 1:
+    blocked_boxes = [box.code for box in merged_boxes if not getattr(box, "quantity_confirmed", True)]
+    if blocked_boxes:
+        if len(merged_boxes) == 1:
+            box = merged_boxes[0]
+            title = f"{BASE_TITLE}——{box.code} {box.name}".strip() + "（单箱候选，项目总量未放行）"
+        else:
+            title = f"{BASE_TITLE}（含未标明台数的箱体，项目总量未放行）"
+    elif len(merged_boxes) == 1:
         box = merged_boxes[0]
         title = f"{BASE_TITLE}——{box.code} {box.name}".strip()
         if box.quantity > 1:
@@ -637,6 +719,14 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
         title = f"{BASE_TITLE}（共{total_qty}台）"
     else:
         title = BASE_TITLE
+
+    for line in material_gap_lines(raw):
+        if line not in warnings:
+            warnings.append(line)
+    release_reasons = [
+        item for item in warnings
+        if "项目总量未放行" in item or "不能按箱号合并" in item
+    ]
 
     seen = set()
     requirements = []
@@ -659,5 +749,10 @@ def assemble(raw: RawExtraction, meta: dict | None = None) -> ExtractionResult:
         topology=topology,
         reconciliation=reconciliation,
         evidence_store=evidence_store,
+        bom_release=BomRelease(
+            project_total_released=not blocked_boxes,
+            blocked_boxes=blocked_boxes,
+            reasons=release_reasons,
+        ),
         meta=AssembledMeta(**(meta or {})),
     )

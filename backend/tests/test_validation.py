@@ -301,6 +301,25 @@ class PageAndTileTests(unittest.TestCase):
         self.assertEqual(result.circuits[0].bbox.page, 3)
         self.assertEqual(result.uncertainties[0].bbox.page, 3)
 
+    def test_vision_box_quantity_stays_unconfirmed(self):
+        with patch.dict(os.environ, {"VISION_API_KEY": "test-only"}):
+            provider = VisionProvider()
+        payload = json.dumps({
+            "boxes": [{"code": "AL1", "name": "照明配电箱", "quantity": 2, "quantity_confirmed": True}],
+            "circuits": [{"box": "AL1", "circuit_no": "WL1", "breaker": "MCB-C16A/1P", "load_name": "走廊照明"}],
+            "extra_devices": [], "requirements": [], "uncertainties": [],
+        })
+        with patch.object(vision, "_data_url", return_value="data:image/png;base64,AA"), \
+             patch.object(provider, "_call", return_value={
+                 "choices": [{"message": {"content": payload}}]}):
+            raw = provider.extract([("p1.png", 1, None)])
+        self.assertFalse(raw.boxes[0].quantity_confirmed)
+        self.assertIn("项目总量未放行", raw.boxes[0].note)
+        result = assemble(raw)
+        self.assertFalse(result.bom_release.project_total_released)
+        breakers = [item for item in result.components if item.spec == "MCB-C16A/1P"]
+        self.assertEqual(breakers[0].quantity, 1)
+
     def test_concurrent_extraction_preserves_order_and_progress(self):
         with patch.dict(os.environ, {"VISION_API_KEY": "test-only", "VISION_CONCURRENCY": "4"}):
             provider = VisionProvider()
@@ -921,6 +940,57 @@ class DistributionTopologyAndExcelTests(unittest.TestCase):
         al2_children = {c.code: c for c in child_codes["01AL2"].children}
         self.assertIn("01AL2-2", al2_children)
         self.assertEqual(al2_children["01AL2-2"].node_type, "secondary")
+
+    def test_unnamed_upstream_is_marked_not_guessed(self):
+        from extractor.assemble import assemble
+        from extractor.schema import RawExtraction
+
+        raw = RawExtraction.model_validate({
+            "boxes": [
+                {"code": "1AL1", "name": "照明配电箱", "quantity": 1,
+                 "note": "进线详上级配电箱系统图"},
+                {"code": "2AL1", "name": "照明配电箱", "quantity": 1},
+            ],
+            "circuits": [
+                {"box": "1AL1", "circuit_no": "进线", "load_name": "进线",
+                 "note": "进线详上级配电箱系统图"},
+                {"box": "2AL1", "circuit_no": "WL1", "load_name": "走廊照明"},
+            ],
+            "extra_devices": [], "requirements": [], "uncertainties": [],
+        })
+        nodes = {node.code: node for node in assemble(raw).topology}
+        self.assertEqual(nodes["1AL1"].parent_code, "")
+        self.assertIn("上级箱号未在图中标明", nodes["1AL1"].note)
+        self.assertNotIn("上级箱号未在图中标明", nodes["2AL1"].note)
+
+    def test_named_upstream_becomes_the_parent(self):
+        """「由某箱引来」写明了箱号时，该箱是上级，不能当成下级，也不能再说未标明。"""
+        from extractor.assemble import assemble
+        from extractor.schema import RawExtraction
+
+        raw = RawExtraction.model_validate({
+            "boxes": [
+                {"code": "00AL01", "name": "道路照明配电箱", "quantity": 1},
+                {"code": "01LBZ3", "name": "配电箱", "quantity": 1},
+            ],
+            "circuits": [
+                {"box": "00AL01", "circuit_no": "N11", "load_name": "室外景观照明预留",
+                 "note": "由01LBZ3引来"},
+            ],
+            "extra_devices": [], "requirements": [], "uncertainties": [],
+        })
+        result = assemble(raw)
+        nodes = {}
+
+        def walk(items):
+            for node in items:
+                nodes[node.code] = node
+                walk(node.children or [])
+
+        walk(result.topology)
+        self.assertEqual(nodes["00AL01"].parent_code, "01LBZ3")
+        self.assertNotIn("上级箱号未在图中标明", nodes["00AL01"].note)
+        self.assertEqual(nodes["01LBZ3"].parent_code, "")
 
     def test_excel_export_contains_topology_sheet(self):
         import openpyxl

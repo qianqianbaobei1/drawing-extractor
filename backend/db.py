@@ -499,6 +499,7 @@ def _row_to_job(row: sqlite3.Row) -> dict:
         "target_brand": target_brand,
         "sheet_names": sheet_names,
         "status": row["status"],
+        "excel": f"/api/jobs/{row['id']}/excel" if row["status"] == "done" else None,
         "progress": row["progress"],
         "pages": row["pages"],
         "box_code": row["box_code"],

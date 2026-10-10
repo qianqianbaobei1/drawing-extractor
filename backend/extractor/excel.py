@@ -72,11 +72,12 @@ def _val(obj: Any, key: str, default: Any = "") -> Any:
 
 
 def sanitize_excel_value(val: Any) -> Any:
-    """防范 Excel / CSV 公式注入与 DDE 命令执行 (Formula Injection 防御)。
-    若单元格为字符串类型且以 =、+、-、@、\t、\r 开头，且不是受信任的内部合法公式，
-    自动前置单引号进行安全转义，防止客户端被恶意利用执行外部程序。
-    """
+    """防范 Excel / CSV 公式注入与 DDE 命令执行，并清洗 openpyxl 不支持的非法控制字符。"""
     if isinstance(val, str) and val:
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        val = ILLEGAL_CHARACTERS_RE.sub("", val)
+        if not val:
+            return ""
         if val[0] in ('=', '+', '-', '@', '\t', '\r'):
             # 允许受信任的安全内部统计公式（如 SUM, ROUND 等受控格式），阻断命令或外部 DDE 执行
             is_internal_formula = (
@@ -327,7 +328,7 @@ def _fill_box_cards_detail_sheet(ws, title: str, subtitle: str, boxes: list[Any]
 
                 row_vals = [c_i, cir_no, load_name, "微断/塑壳", breaker, contactor, power_kw, phase, cable, note]
                 for j, v in enumerate(row_vals, start=1):
-                    cell = ws.cell(row=r, column=j, value=v)
+                    cell = ws.cell(row=r, column=j, value=sanitize_excel_value(v))
                     cell.font = CELL_FONT
                     cell.alignment = CENTER if j in (1, 2, 4, 7, 8) else LEFT
                     cell.border = BORDER

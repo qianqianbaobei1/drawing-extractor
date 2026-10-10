@@ -18,10 +18,35 @@ from .schema import (
     normalize_code,
 )
 
-# 常见低压配电箱/柜代号前缀来自 config/domain.json 的 catalog 段
+# 箱号词法与箱体提取共用 extract_panel_code，目录不再维护一份例外名单。
+from .cad_extractor import extract_panel_code, iter_panel_codes
 from .config import domain as _domain
 
-PANEL_PREFIX_PATTERN = _domain()["catalog"]["panel_prefix_pattern"]
+_CATALOG = _domain()["catalog"]
+PANEL_PREFIX_PATTERN = _CATALOG["panel_prefix_pattern"]
+_CAD_DOMAIN = _domain()["cad"]
+
+
+def _accept_panel_code(code: str) -> bool:
+    """与箱体提取同一词法：过不了 extract_panel_code 的就不是目录里的箱号。"""
+    got = extract_panel_code(code)
+    return bool(got) and normalize_code(got) == normalize_code(code)
+
+
+def _split_slash_group(code: str) -> list[str]:
+    """AP1/AP2 是多台；AW1/2/3 这种斜杠后为数字的是一台并排箱。"""
+    parts = [part for part in code.split("/") if part]
+    if len(parts) > 1 and all(_accept_panel_code(part) for part in parts):
+        return [normalize_code(part) for part in parts]
+    return [normalize_code(code)]
+
+
+def _is_schedule_line(text: str, declared: list[str]) -> bool:
+    """单独一个代号是图面标注。范围、多台，或带箱体/系统图字样，才是目录声明。"""
+    if len(declared) >= 2 or re.search(r"[~～至到]", text):
+        return True
+    cues = list(_CAD_DOMAIN.get("unit_caption_suffix") or []) + list(_CAD_DOMAIN.get("system_keywords_include") or [])
+    return any(cue and cue in text for cue in cues)
 
 
 def expand_panel_range(text: str) -> list[str]:
@@ -44,7 +69,7 @@ def expand_panel_range(text: str) -> list[str]:
 
     def add_code(c: str):
         nc = normalize_code(c)
-        if nc and nc not in seen:
+        if nc and nc not in seen and _accept_panel_code(nc):
             seen.add(nc)
             results.append(nc)
 
@@ -59,6 +84,19 @@ def expand_panel_range(text: str) -> list[str]:
     )
 
     remaining_text = cleaned
+    # 楼层在前、字母后缀在后：3~10RDAL → 3RDAL…10RDAL。纯数字区间仍然不是箱号。
+    suffix_range = re.compile(
+        r"(?<![A-Za-z0-9])(\d+)\s*[~～至到]\s*(\d+)([A-Za-z][A-Za-z0-9]*)"
+    )
+    for match in suffix_range.finditer(cleaned):
+        start_n = int(match.group(1))
+        end_n = int(match.group(2))
+        suffix = match.group(3)
+        if 0 < end_n - start_n <= 150 and start_n > 0:
+            for i in range(start_n, end_n + 1):
+                add_code(f"{i}{suffix}")
+            remaining_text = remaining_text.replace(match.group(0), " ")
+
     for match in range_regex.finditer(cleaned):
         prefix1, num1_str, sep, prefix2, num2_str = match.groups()
         prefix2 = prefix2 or ""
@@ -68,6 +106,9 @@ def expand_panel_range(text: str) -> list[str]:
 
         if not norm_p2 or norm_p1 == norm_p2:
             effective_prefix = prefix1
+            # 纯数字区间（页码、尺寸、电流）不是箱号范围，展开会造出 12、13 这类假漏柜。
+            if not re.search(r"[A-Za-z]", effective_prefix):
+                continue
             try:
                 start_n = int(num1_str)
                 end_n = int(num2_str)
@@ -79,15 +120,10 @@ def expand_panel_range(text: str) -> list[str]:
             except ValueError:
                 pass
 
-    # 2. 如果包含逗号、顿号、斜杠、空格或汉字包围的离散箱体
-    # 如 "1AL1, 1AL2, 2AP1" 或 "AP1/AP2/AP3" 或 "01B-01 1AL1配电箱系统图"
-    token_regex = re.compile(
-        rf"(?<![A-Za-z0-9_\-])((?:[B\-\d]{{1,4}})?{PANEL_PREFIX_PATTERN}[A-Za-z0-9_\-]*\d+[A-Za-z0-9_\-]*)(?![A-Za-z0-9_\-])",
-        re.IGNORECASE
-    )
-    for match in token_regex.finditer(remaining_text):
-        code = match.group(1)
-        add_code(code)
+    # 2. 离散箱号与并排箱，走和提取器相同的词法，不再按一份前缀表另判。
+    for code in iter_panel_codes(remaining_text):
+        for piece in _split_slash_group(code):
+            add_code(piece)
 
     return results
 
@@ -133,9 +169,14 @@ class DrawingCatalogReconciler:
             sheet_no = m_no.group(1).strip()
             sheet_title = m_no.group(2).strip()
 
-        # 提取所声明的配电箱范围
+        # 提取所声明的配电箱范围。孤立代号不是目录漏项。
         declared = expand_panel_range(sheet_title)
-        if not declared and not sheet_no:
+        if (not declared and sheet_no and _accept_panel_code(sheet_no)
+                and _is_schedule_line(text, [normalize_code(sheet_no)])):
+            declared = [normalize_code(sheet_no)]
+        if declared and not _is_schedule_line(text, declared):
+            declared = []
+        if not declared:
             return None
 
         return CatalogItem(

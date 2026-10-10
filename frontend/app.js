@@ -2135,6 +2135,7 @@ function applyEdit(scope, idx, field, value) {
     if (!(n > 0)) { toast('数量必须是大于 0 的数字'); renderSub(); return; }
     if (n === before) { renderSub(); return; }
     row[field] = n;
+    if (scope === 'box') row.quantity_confirmed = true;
   } else {
     if (value === '' || String(before ?? '') === value) { renderSub(); return; }
     row[field] = value;
@@ -2678,6 +2679,15 @@ function triggerDownload(url, filename) {
   return a;
 }
 
+function exportReleaseChecks(summary, data) {
+  const rules = (summary && summary.release_checks) || (data && data.release_checks) || [];
+  return rules.map(rule => ({
+    ok: !!rule.ok,
+    title: rule.title || "放行检查",
+    note: rule.note || "",
+  }));
+}
+
 function openExport() {
   if (!S.jobId) { toast('先打开一份图纸'); return; }
   const un = unresolved().length;
@@ -2718,6 +2728,21 @@ function openExport() {
         : `${slice.total_images} 页均为整页送检，未触发切片`
     });
   }
+  const read = summary.read_report;
+  if (read && read.status) {
+    const label = {
+      supported: "支持范围内已盘点",
+      degraded: "降级，影响已写入原因",
+      insufficient: "关键条件不足",
+    }[read.status] || read.status;
+    const reasons = (read.reasons || []).join("；");
+    checks.push({
+      ok: read.status === "supported",
+      title: "图纸读取盘点",
+      note: `${label}${reasons ? "。" + reasons : ""}。覆盖率保持为空，退出码不能代替读全`,
+    });
+  }
+  exportReleaseChecks(summary, S.data).forEach(rule => checks.push(rule));
   const corr = summary.corroboration;
   if (corr) {
     if (!corr.available) {
@@ -3109,6 +3134,7 @@ function applyCropBoxInfoInternal(info) {
       location: info.location || '',
       size: info.size || '',
       quantity: info.quantity || 1,
+      quantity_confirmed: false,
       note: info.note || '',
     });
     return true;

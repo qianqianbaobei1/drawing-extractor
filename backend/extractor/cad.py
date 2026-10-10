@@ -25,6 +25,8 @@ from ezdxf.path import Path
 from ezdxf.fonts import ttfonts
 import pymupdf
 
+from .cad_ledger import entity_source, join_insert_path
+
 # 防护补丁：针对 CAD 图纸中引用的生僻或特殊损坏字形，防止 fontTools 抛出 'Glyph' object has no attribute 'flags' 导致渲染中断
 _orig_get_glyph_path = getattr(ttfonts.TTFontRenderer, "get_glyph_path", None)
 if _orig_get_glyph_path:
@@ -80,33 +82,62 @@ def sanitize_surrogates(text: str) -> str:
 
 
 def clean_mtext(raw_text: str) -> str:
-    """清理 AutoCAD MTEXT 常见的格式控制代码（如 \\P, \\A1;, \\fSimSun; 等）。"""
+    """清理 AutoCAD MTEXT 常见的格式控制代码（如 \\P, \\A1;, \\fSimSun; 等）与非法控制字符。"""
     if not raw_text:
         return ""
     t = sanitize_surrogates(raw_text)
     # 替换特殊电气工程字符
     t = t.replace("%%c", "Φ").replace("%%C", "Φ").replace("%%d", "°").replace("%%p", "±")
-    # 替换换行控制
-    t = t.replace(r"\P", "\n").replace(r"\p", "\n")
-    # 移除字体、堆叠、颜色等控制码 \F...; \C...; \H...; \W...; \A...;
-    t = re.sub(r"\\[A-Za-z0-9]+\;?", "", t)
-    # 移除花括号堆叠分组 {}
-    t = re.sub(r"[{}]", "", t)
+    # 优先使用 ezdxf 经过实战检验的 fast_plain_mtext 剔除全部 MTEXT 格式控制序列
+    try:
+        from ezdxf.tools.text import fast_plain_mtext
+        t = fast_plain_mtext(t)
+    except Exception:
+        t = t.replace(r"\P", "\n").replace(r"\p", "\n")
+        t = re.sub(r"[{}]", "", t)
+    # 解码 AutoCAD 的 \\U+xxxx Unicode 转义字符（如 \\U+201C -> “，\\U+201D -> ”）
+    try:
+        t = re.sub(r"\\+U\+([0-9A-Fa-f]{4})", lambda m: chr(int(m.group(1), 16)), t)
+    except Exception:
+        pass
+    # 移除残留的控制码与未识别转义（如 \\ud83d, \\A1; 等）
+    t = re.sub(r"\\+[A-Za-z0-9]+\;?", "", t)
+    # 过滤无法在 XML / Excel / JSON 中安全显示的 ASCII 控制字符 (ASCII 0-31，保留 \t, \n, \r)
+    t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", t)
     # 合并多余空白
     t = re.sub(r"[ \t]+", " ", t).strip()
     return t
 
 
 def dwg_to_dxf(dwg_path: str, dxf_path: str) -> bool:
-    """调用 LibreDWG 的 dwg2dxf 工具将 DWG 转换为 DXF。"""
+    """调用 LibreDWG 的 dwg2dxf 工具将 DWG 转换为 DXF。
+
+    返回值只表示这一步退出码为 0 且输出非空。警告、外参和代理对象记在转换记录里，
+    由读取盘点决定是降级还是关键条件不足。
+    """
+    from .cad_ledger import classify_stderr, conversion_accepted, remember_conversion
+
     tool = find_dwg2dxf_tool()
     if not tool:
         raise RuntimeError("未检测到 dwg2dxf 转换工具，请确保已安装 libredwg")
     cmd = [tool, "-y", "-o", dxf_path, dwg_path]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-    if res.returncode == 0 and os.path.exists(dxf_path) and os.path.getsize(dxf_path) > 0:
-        return True
-    return False
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", check=False)
+    output_nonempty = os.path.exists(dxf_path) and os.path.getsize(dxf_path) > 0
+    warning_lines, error_lines, excerpt = classify_stderr(res.stderr or "")
+    record = {
+        "tool": os.path.basename(tool),
+        "exit_code": res.returncode,
+        "output_nonempty": output_nonempty,
+        "accepted": conversion_accepted(res.returncode, output_nonempty),
+        "warning_lines": warning_lines,
+        "error_lines": error_lines,
+        "stderr_excerpt": excerpt,
+        "log_missing": False,
+        "note": "退出码 0 且输出非空只说明转换步骤返回了文件",
+    }
+    remember_conversion(dwg_path, record)
+    remember_conversion(dxf_path, record)
+    return bool(record["accepted"])
 
 
 def dwg_to_svg_fallback(dwg_path: str, svg_path: str) -> bool:
@@ -123,10 +154,13 @@ def dwg_to_svg_fallback(dwg_path: str, svg_path: str) -> bool:
 def load_dxf_document(dxf_path: str):
     """安全读取 DXF 文件，在格式异常时自动尝试 recover 模式。"""
     try:
-        return ezdxf.readfile(dxf_path)
+        doc = ezdxf.readfile(dxf_path)
+        doc.extractor_recovered = False
+        return doc
     except Exception:
         from ezdxf import recover
         doc, _ = recover.readfile(dxf_path)
+        doc.extractor_recovered = True
         return doc
 
 
@@ -830,7 +864,8 @@ def _frame_texts(index: GeometryIndex, rect, cached: dict, block_text: bool = Fa
             txt = clean_mtext(raw)
             if txt:
                 texts.append({"text": txt, "x": float(e.dxf.insert.x), "y": float(e.dxf.insert.y),
-                              "layer": str(e.dxf.layer), "height": _text_height(e, kind)})
+                              "layer": str(e.dxf.layer), "height": _text_height(e, kind),
+                              "source": entity_source(e, owner="modelspace", insert_path="")})
         elif kind == "INSERT":
             inserts.append(e)
     if block_text:
@@ -860,7 +895,8 @@ def _local_block_texts(doc: Any, name: str, cache: dict, depth: int = 0) -> list
                 txt = clean_mtext(raw)
                 if txt:
                     out.append({"text": txt, "x": float(e.dxf.insert.x), "y": float(e.dxf.insert.y),
-                                "layer": str(getattr(e.dxf, "layer", "")), "height": _text_height(e, kind)})
+                                "layer": str(getattr(e.dxf, "layer", "")), "height": _text_height(e, kind),
+                                "source": entity_source(e, owner=name, insert_path="")})
             elif kind == "INSERT" and depth < 4:
                 sub = _local_block_texts(doc, e.dxf.name, cache, depth + 1)
                 if not sub:
@@ -869,9 +905,14 @@ def _local_block_texts(doc: Any, name: str, cache: dict, depth: int = 0) -> list
                     m = e.matrix44()
                 except Exception:
                     continue
+                nested = entity_source(e, owner=name, insert_path="")
                 for s in sub:
                     p = m.transform((s["x"], s["y"], 0.0))
-                    out.append({**s, "x": float(p[0]), "y": float(p[1])})
+                    src = dict(s.get("source") or {})
+                    src["insert_path"] = join_insert_path(
+                        f"{e.dxf.name}@{nested['handle']}", str(src.get("insert_path") or ""))
+                    src["owner"] = str(e.dxf.name)
+                    out.append({**s, "x": float(p[0]), "y": float(p[1]), "source": src})
     except Exception:
         pass
     cache[name] = out
@@ -879,8 +920,14 @@ def _local_block_texts(doc: Any, name: str, cache: dict, depth: int = 0) -> list
 
 
 def _explode_texts(ins: Any, cache: dict) -> list[dict[str, Any]]:
-    """取块参照内部的文字与属性文字，坐标折到模型空间绝对坐标。"""
+    """取块参照内部的文字与属性文字，坐标折到模型空间绝对坐标。
+
+    插入路径带上这次 INSERT 的 handle。块定义里的文字 handle 在每次插入时相同，
+    不能单独拿来当器件身份。
+    """
     out: list[dict[str, Any]] = []
+    insert_identity = entity_source(ins, owner="modelspace", insert_path="")
+    instance_path = f"{ins.dxf.name}@{insert_identity['handle']}"
     doc = getattr(ins, "doc", None)
     if doc is not None:
         local = _local_block_texts(doc, ins.dxf.name, cache)
@@ -890,17 +937,26 @@ def _explode_texts(ins: Any, cache: dict) -> list[dict[str, Any]]:
             except Exception:
                 m = None
             for s in local:
+                src = dict(s.get("source") or {})
+                src["insert_path"] = join_insert_path(instance_path, str(src.get("insert_path") or ""))
+                src["owner"] = str(ins.dxf.name)
                 if m is not None:
                     p = m.transform((s["x"], s["y"], 0.0))
-                    out.append({**s, "x": float(p[0]), "y": float(p[1])})
+                    out.append({**s, "x": float(p[0]), "y": float(p[1]), "source": src})
                 else:
-                    out.append(dict(s))
+                    out.append({**s, "source": src})
     for attrib in getattr(ins, "attribs", []):
         txt = clean_mtext(str(getattr(attrib.dxf, "text", "")))
         if txt:
+            attrib_identity = entity_source(attrib, owner=str(ins.dxf.name), insert_path="")
             out.append({"text": txt, "x": float(attrib.dxf.insert.x), "y": float(attrib.dxf.insert.y),
                         "layer": str(getattr(attrib.dxf, "layer", "")),
-                        "height": _text_height(attrib, "ATTRIB")})
+                        "height": _text_height(attrib, "ATTRIB"),
+                        "source": entity_source(
+                            attrib,
+                            owner=str(ins.dxf.name),
+                            insert_path=join_insert_path(instance_path, attrib_identity["handle"]),
+                        )})
     return out
 
 
@@ -962,11 +1018,11 @@ def _unit_rects(index: GeometryIndex, frame_rect) -> list[tuple[float, float, fl
 
 
 def _match_box_rect(rects, cap) -> tuple[float, float, float, float] | None:
-    """给箱名文字找它所属的箱框：优先“包含箱名”的框，否则找正上方最近的框。"""
+    """给箱名文字找它所属的箱框：优先“包含箱名”的最大外框，否则找正上方最近的框。"""
     cx, cy = cap["x"], cap["y"]
     inside = [r for r in rects if r[0] <= cx <= r[2] and r[1] <= cy <= r[3]]
     if inside:
-        return min(inside, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+        return max(inside, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
     cands = []
     for r in rects:
         dy = r[1] - cy
@@ -978,7 +1034,9 @@ def _match_box_rect(rects, cap) -> tuple[float, float, float, float] | None:
         cands.append((abs(dy) if dy >= 0 else dy + 1e6, r))
     if not cands:
         return None
-    return min(cands, key=lambda c: c[0])[1]
+    min_dy = min(c[0] for c in cands)
+    best_cands = [c[1] for c in cands if abs(c[0] - min_dy) < 500.0]
+    return max(best_cands, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
 
 
 def _column_pitch(rects) -> float:
@@ -994,15 +1052,16 @@ def _column_pitch(rects) -> float:
 def _cell_crop(rect, rects, frame, caption_y: float, pitch_x: float) -> tuple[float, float, float, float]:
     """把箱框撑成完整的单元块。
 
-    图纸上的虚线箱框只圈住断路器那一列，右侧的电缆规格栏和负荷名称栏画在框外（实测
-    每页被截掉两列），箱框左侧反而是内容起点。所以：
-      左边界 = 箱框左边 - 少量留白（箱框左就是内容起点）；
-      右边界 = 右邻箱框的左边（相邻箱内容首尾相接，没有空带可依靠）；
-      右邻不存在时用整张图的列距推；
-      下边界 = 自适应上下两行配电箱间距，严格收于下邻箱框顶部之上，杜绝带进下排表头。
+    图纸上的虚线箱框只圈住断路器那一列，右侧的电缆规格栏和负荷名称栏画在框外，
+    箱框左侧是内容起点。必须过滤出真正的主体箱框作为邻接边界，杜绝将箱内局部表格列
+    误作为右邻截断。
     """
     x0, y0, x1, y1 = rect
     w, h = x1 - x0, y1 - y0
+
+    # 过滤出独立主体单元框（排除局部小表头与细分列矩形），防止将内部电表栏/负荷栏误判为右邻单元
+    substantial = [r for r in rects if (r[2] - r[0]) >= 5000.0 and (r[3] - r[1]) >= 8000.0]
+    eval_rects = substantial if len(substantial) >= 2 else rects
 
     def v_overlap(r):
         return min(r[3], y1) - max(r[1], y0) > CROP_OVERLAP_RATIO * min(h, r[3] - r[1])
@@ -1010,8 +1069,8 @@ def _cell_crop(rect, rects, frame, caption_y: float, pitch_x: float) -> tuple[fl
     def h_overlap(r):
         return min(r[2], x1) - max(r[0], x0) > CROP_OVERLAP_RATIO * min(w, r[2] - r[0])
 
-    right_gaps = [r[0] - x1 for r in rects if r is not rect and v_overlap(r) and r[0] >= x1]
-    top_gaps = [r[1] - y1 for r in rects if r is not rect and h_overlap(r) and r[1] >= y1]
+    right_gaps = [r[0] - x1 for r in eval_rects if r is not rect and v_overlap(r) and r[0] >= x1]
+    top_gaps = [r[1] - y1 for r in eval_rects if r is not rect and h_overlap(r) and r[1] >= y1]
     if right_gaps:
         right = x1 + min(right_gaps)
     else:
@@ -1021,7 +1080,7 @@ def _cell_crop(rect, rects, frame, caption_y: float, pitch_x: float) -> tuple[fl
                     else min(h * CROP_HEIGHT_RATIO, CROP_TOP_MAX_PAD)), frame[3])
 
     # 下邻箱框自适应安全裁切（同列且位于当前箱框下方）
-    bottom_cands = [r for r in rects if r is not rect and h_overlap(r) and r[3] <= y0]
+    bottom_cands = [r for r in eval_rects if r is not rect and h_overlap(r) and r[3] <= y0]
     if bottom_cands:
         below_top = max(r[3] for r in bottom_cands)
         # 当前箱名下边界：箱名文字下方留白
@@ -1037,6 +1096,32 @@ def _cell_crop(rect, rects, frame, caption_y: float, pitch_x: float) -> tuple[fl
     bottom = max(frame[1], bottom)
 
     return (max(frame[0], x0 - CROP_PAD_SIDE), bottom, right, top)
+
+
+def _extract_unit_box_code(crop_texts: list[dict[str, Any]]) -> str | None:
+    """从单元块文本中提取配电箱编号（如 2SAL1, SAW1）。"""
+    from .cad_extractor import extract_panel_code
+    for t in crop_texts:
+        txt = t.get("text", "")
+        if "设备编号" in txt or "箱体编号" in txt:
+            clean = txt.replace("设备编号", "").replace("箱体编号", "").replace(":", "").replace("：", "").strip()
+            if clean:
+                c = extract_panel_code(clean)
+                if c:
+                    return c
+            # 横向相邻单元格文字
+            nearby = [t2 for t2 in crop_texts if abs(t2["y"] - t["y"]) < 600 and t2["x"] > t["x"]]
+            if nearby:
+                nearby.sort(key=lambda t2: t2["x"])
+                for n in nearby:
+                    c = extract_panel_code(n.get("text", ""))
+                    if c:
+                        return c
+    for t in crop_texts:
+        c = extract_panel_code(t.get("text", ""))
+        if c:
+            return c
+    return None
 
 
 def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1071,11 +1156,15 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
             if rect is None or id(rect) in used:
                 continue
             crop = _cell_crop(rect, rects, fbox, cap["y"], pitch_x)
-            label = cap["text"].replace(" ", "")
+            crop_texts = _frame_texts(index, crop, text_cache, block_text=True)
+            box_code = _extract_unit_box_code(crop_texts)
+            cap_name = cap["text"].replace(" ", "")
+            label = f"{box_code} {cap_name}" if box_code else cap_name
+
             long_units = max(crop[2] - crop[0], crop[3] - crop[1])
             block_scale = max(long_units / UNIT_PAGE_LONG_MM, 1e-6)
             blocks.append({"rect": crop, "label": label, "frame": frame["title"],
-                           "scale": block_scale})
+                           "scale": block_scale, "box_code": box_code or ""})
             made += 1
             used.add(id(rect))
         if made:
@@ -1083,7 +1172,7 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
         elif _classify_frame(frame["title"]) == "system":
             frame["kind"] = "system"
             blocks.append({"rect": fbox, "label": frame["title"] or "系统图",
-                           "frame": frame["title"], "scale": scale})
+                           "frame": frame["title"], "scale": scale, "box_code": ""})
         else:
             frame["kind"] = "skip"
     return blocks
@@ -1128,6 +1217,7 @@ def render_cad_unit_blocks(doc: Any, blocks: list[dict[str, Any]], out_pdf_path:
             for t in _frame_texts(index, block["rect"], text_cache, block_text=True):
                 texts.append({"type": "TEXT", "text": t["text"], "x": round(t["x"], 1),
                               "y": round(t["y"], 1), "page": idx, "sheet": block["label"],
+                              "box_code": block.get("box_code") or "",
                               "layer": t["layer"]})
     finally:
         combined.save(out_pdf_path)
@@ -1177,6 +1267,7 @@ def extract_cad_entities(dxf_path: str, doc: Any = None) -> list[dict[str, Any]]
                 "height": round(height, 2),
                 "rotation": round(rotation, 1),
                 "layer": layer,
+                "source": entity_source(entity, owner="modelspace", insert_path=""),
             })
         except Exception:
             continue
@@ -1200,6 +1291,7 @@ def extract_cad_entities(dxf_path: str, doc: Any = None) -> list[dict[str, Any]]
                 "height": round(height, 2),
                 "rotation": round(rotation, 1),
                 "layer": layer,
+                "source": entity_source(entity, owner="modelspace", insert_path=""),
             })
         except Exception:
             continue
@@ -1213,6 +1305,8 @@ def extract_cad_entities(dxf_path: str, doc: Any = None) -> list[dict[str, Any]]
                 val = clean_mtext(str(getattr(attrib.dxf, "text", "")))
                 tag = sanitize_surrogates(str(getattr(attrib.dxf, "tag", "")))
                 if val:
+                    insert_identity = entity_source(entity, owner="modelspace", insert_path="")
+                    attrib_identity = entity_source(attrib, owner=block_name, insert_path="")
                     extracted.append({
                         "type": "ATTRIB",
                         "block": block_name,
@@ -1222,6 +1316,14 @@ def extract_cad_entities(dxf_path: str, doc: Any = None) -> list[dict[str, Any]]
                         "y": round(float(attrib.dxf.insert.y), 2),
                         "height": round(float(getattr(attrib.dxf, "height", UNIT_CAPTION_DEFAULT_HEIGHT)), 2),
                         "layer": layer,
+                        "source": entity_source(
+                            attrib,
+                            owner=block_name,
+                            insert_path=join_insert_path(
+                                f"{block_name}@{insert_identity['handle']}",
+                                attrib_identity["handle"],
+                            ),
+                        ),
                     })
         except Exception:
             continue
@@ -1291,7 +1393,24 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
     work_dir = os.path.dirname(cad_path)
     base_name = os.path.splitext(os.path.basename(cad_path))[0]
 
+    from .cad_ledger import build_read_report, stamp_records, write_read_report
+
     dxf_to_clean = None
+    converter = "native_dxf"
+    dxf_path = cad_path
+
+    def _deliver(texts: list[dict[str, Any]], doc: Any, used_converter: str) -> tuple[str, list[dict[str, Any]]]:
+        stamp_records(texts, cad_path)
+        report = build_read_report(
+            cad_path,
+            doc=doc,
+            converter=used_converter,
+            dxf_path=dxf_path if used_converter != "svg_fallback" else None,
+            recovered=bool(getattr(doc, "extractor_recovered", False)) if doc is not None else False,
+        )
+        write_read_report(out_pdf_path, report)
+        return out_pdf_path, texts
+
     if ext == ".dwg":
         cache_dir = os.path.join(work_dir, ".cad_cache")
         os.makedirs(cache_dir, exist_ok=True)
@@ -1299,6 +1418,7 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
         cache_key = hashlib.md5(f"{base_name}_{file_size}".encode()).hexdigest()
         cached_dxf = os.path.join(cache_dir, f"{cache_key}.dxf")
 
+        converter = "libredwg"
         dxf_success = False
         if os.path.exists(cached_dxf) and os.path.getsize(cached_dxf) > 0:
             dxf_path = cached_dxf
@@ -1322,10 +1442,11 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
                     except OSError:
                         pass
                 if ok and os.path.exists(out_pdf_path) and os.path.getsize(out_pdf_path) > 0:
-                    return out_pdf_path, []
+                    return _deliver([], None, "svg_fallback")
             raise RuntimeError(f"无法将 DWG 文件 {os.path.basename(cad_path)} 转换为预览格式")
     elif ext == ".dxf":
         dxf_path = cad_path
+        converter = "native_dxf"
     else:
         raise ValueError(f"不支持的 CAD 文件格式: {ext}")
 
@@ -1341,7 +1462,7 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
                 if blocks:
                     extracted_texts = render_cad_unit_blocks(doc, blocks, out_pdf_path, index)
                     if os.path.exists(out_pdf_path) and os.path.getsize(out_pdf_path) > 0:
-                        return out_pdf_path, extracted_texts
+                        return _deliver(extracted_texts, doc, converter)
         except Exception as exc:  # noqa: BLE001 - 几何分幅异常时退回旧链路，不能让上传直接失败
             print(f"[CAD] 几何分幅失败，回退旧切片链路: {exc}")
 
@@ -1350,7 +1471,7 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
         if len(system_sheets) >= 1:
             extracted_texts = slice_and_render_cad_sheets(doc, system_sheets, out_pdf_path)
             if os.path.exists(out_pdf_path) and os.path.getsize(out_pdf_path) > 0:
-                return out_pdf_path, extracted_texts
+                return _deliver(extracted_texts, doc, converter)
 
         # 3. 若未探测出系统图分幅图框，检查是否属于不包含系统图的海量平面施工图
         msp = doc.modelspace()
@@ -1366,7 +1487,7 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
         ok = render_dxf_to_pdf(dxf_path, out_pdf_path, doc=doc)
         if not ok:
             raise RuntimeError("CAD 渲染为 PDF 失败")
-        return out_pdf_path, extracted_texts
+        return _deliver(extracted_texts, doc, converter)
     finally:
         if dxf_to_clean:
             try:

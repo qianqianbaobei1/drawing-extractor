@@ -22,6 +22,9 @@ from extractor.config import config_health, delivery, domain, pipeline
 from extractor.schema import CONTRACT_VERSION, PROMPT_VERSION, Uncertainty, RawExtraction, ExtractionResult, Box
 from extractor.excel import build_workbook, build_project_bom_workbook
 from extractor.cad import is_cad_path, process_cad_file
+from extractor.cad_ledger import apply_read_gate
+from extractor.panel_release import release_lines
+from extractor.cad_extractor import assign_preview_bboxes
 from extractor.catalog import analyze_components_replacement
 from extractor.catalog_reconciler import DrawingCatalogReconciler, CatalogItem
 from db import (
@@ -260,6 +263,7 @@ def process_drawing_file(job_id: str, raw_path: str, filename: str):
         pdf_path = os.path.join(WORKDIR, f"{job_id}.pdf")
         try:
             _, cad_texts = process_cad_file(raw_path, pdf_path)
+            _load_read_report(job, pdf_path)
             if cad_texts:
                 with open(os.path.join(WORKDIR, f"{job_id}_cad_texts.json"), "w", encoding="utf-8") as f:
                     json.dump(cad_texts, f, ensure_ascii=False, indent=2)
@@ -280,10 +284,12 @@ def process_drawing_file(job_id: str, raw_path: str, filename: str):
                 circuits_with_breaker = sum(1 for c in cad_raw.circuits if (c.breaker or "").strip())
                 breaker_fill_rate = circuits_with_breaker / total_c if total_c > 0 else 0.0
                 min_fill = float(_GATES["cad_breaker_fill_rate_min"])
-                if breaker_fill_rate >= min_fill:
+                min_abs_breakers = int(_GATES.get("cad_min_breakers_absolute", 20))
+                if breaker_fill_rate >= min_fill or circuits_with_breaker >= min_abs_breakers:
                     process_cad_raw_extraction(job_id, pdf_path, filename, cad_raw)
                     return
                 print(f"[CAD] 原生提取断路器填充率仅 {breaker_fill_rate:.1%} (<{min_fill:.0%})，"
+                      f"且有效断路器数 {circuits_with_breaker} (<{min_abs_breakers})，"
                       f"未通过准入门禁，自动回退到视觉大模型流水线")
         except Exception as cad_err:
             print(f"[CAD] 原生矢量提取降级至视觉模型: {cad_err}")
@@ -388,6 +394,29 @@ def _apply_project_assignment(job_id: str, decision: dict) -> None:
         print(f"[project] 自动归入项目失败: {exc!r}")
 
 
+def _load_read_report(job: dict, pdf_path: str) -> None:
+    """读取这次 CAD 转换旁边的盘点。没有盘点就保持空，不把缺记录写成 100% 或 0。"""
+    path = pdf_path + ".read.json"
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            job["read_report"] = json.load(handle)
+    except Exception as exc:  # noqa: BLE001 - 盘点缺失只影响验收展示，不能拖垮提取
+        print(f"[cad] 读取盘点失败: {exc!r}")
+
+
+def _audit_fields(job: dict, result: ExtractionResult) -> dict:
+    """把读取状态和项目总量放行结果交给任务摘要。读取不足时，已有候选不能当成项目总量。"""
+    release = apply_read_gate(getattr(result, "bom_release", None), job.get("read_report"))
+    report = job.get("read_report")
+    return {
+        "bom_release": release.model_dump() if release is not None else None,
+        "read_report": report,
+        "release_checks": release_lines(result),
+    }
+
+
 def _read_cad_texts(job_id: str) -> list | None:
     """读取 CAD 原生解析阶段落盘的文字（如果有）。"""
     path = os.path.join(WORKDIR, f"{job_id}_cad_texts.json")
@@ -471,6 +500,37 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
             if p_str not in sheet_names:
                 sheet_names[p_str] = f"图纸第 {p_str} 页"
 
+        # 将箱体与回路绑定到对应的切图页码，打通图-表联动
+        page_by_box: dict[str, int] = {}
+        if cad_texts:
+            # 1. 优先按切图单元块的 box_code 精确匹配
+            for t in cad_texts:
+                bcode = t.get("box_code")
+                p = t.get("page")
+                if bcode and p and bcode not in page_by_box:
+                    page_by_box[bcode] = int(p)
+
+            # 2. 按图块标题（如 "2SAL1 照明配电箱"）包含匹配
+            for t in cad_texts:
+                sheet = t.get("sheet") or ""
+                p = t.get("page")
+                if sheet and p:
+                    for b in raw.boxes:
+                        if b.code and b.code not in page_by_box:
+                            if b.code in sheet:
+                                page_by_box[b.code] = int(p)
+
+            # 3. 按页内文字 token 匹配
+            for b in raw.boxes:
+                if b.code and b.code not in page_by_box:
+                    for t in cad_texts:
+                        if t.get("page") and t.get("text", "").strip() == b.code:
+                            page_by_box[b.code] = int(t["page"])
+                            break
+
+        assign_preview_bboxes(raw.boxes, raw.circuits, cad_texts, page_by_box)
+        _drop_tiles(pdf_path)
+
         meta = {
             "model": "CAD-Vector-Topology-Engine",
             "prompt_version": PROMPT_VERSION,
@@ -497,9 +557,15 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
 
         _sync_result_issues(result)
         corroboration = _apply_corroboration(result, cad_texts, pdf_path)
-        # CAD 原生路径不做图像切块：几何来自矢量实体，渲染图仅用于交付预览。
-        slice_plan = {"total_images": len(images), "full_page": len(images),
-                      "tiles": 0, "tile_coverage": None}
+        # CAD 原生路径不做图像切块：几何来自矢量文字坐标，渲染图只给预览。
+        slice_plan = {
+            "mode": "cad_vector",
+            "total_images": len(images),
+            "full_page": len(images),
+            "tiles": 0,
+            "tile_coverage": None,
+            "note": "矢量提取按文字坐标定位，不把切片送视觉模型",
+        }
         project_decision = _resolve_project_info(job, raw, cad_texts, pdf_path, filename)
 
         job["status"] = "building_excel"
@@ -520,6 +586,9 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
             "topology": [t.model_dump() for t in getattr(result, "topology", [])],
             "reconciliation": result.reconciliation.model_dump() if getattr(result, "reconciliation", None) else None,
         }
+        audit = _audit_fields(job, result)
+        data["bom_release"] = audit["bom_release"]
+        data["release_checks"] = audit["release_checks"]
         jobs[job_id].update(
             status="done", excel=f"/api/jobs/{job_id}/excel",
             filename=filename,
@@ -538,6 +607,9 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
                 "project_info": project_decision["info"],
                 "project_note": project_decision["note"],
                 "meta": meta,
+                "bom_release": audit["bom_release"],
+                "read_report": audit["read_report"],
+                "release_checks": audit["release_checks"],
             },
             data=data,
             preview=[c.model_dump() for c in result.components[:50]],
@@ -710,6 +782,9 @@ def process_pdf(job_id: str, pdf_path: str, filename: str):
             "topology": [t.model_dump() for t in getattr(result, "topology", [])],
             "reconciliation": result.reconciliation.model_dump() if getattr(result, "reconciliation", None) else None,
         }
+        audit = _audit_fields(job, result)
+        data["bom_release"] = audit["bom_release"]
+        data["release_checks"] = audit["release_checks"]
         jobs[job_id].update(
             status="done", excel=f"/api/jobs/{job_id}/excel",
             filename=filename,
@@ -730,6 +805,9 @@ def process_pdf(job_id: str, pdf_path: str, filename: str):
                 "project_info": project_decision["info"],
                 "project_note": project_decision["note"],
                 "meta": meta,
+                "bom_release": audit["bom_release"],
+                "read_report": audit["read_report"],
+                "release_checks": audit["release_checks"],
             },
             data=data,
             preview=[c.model_dump() for c in result.components[:50]],
@@ -1422,6 +1500,9 @@ def persist_job_data(job_id: str, job: dict, data: dict,
             else (data.get("reconciliation") or (job.get("data") or {}).get("reconciliation"))
         ),
     }
+    audit = _audit_fields(job, result)
+    job["data"]["bom_release"] = audit["bom_release"]
+    job["data"]["release_checks"] = audit["release_checks"]
     job.setdefault("summary", {})
     job["summary"].update({
         "title": result.title,
@@ -1430,6 +1511,9 @@ def persist_job_data(job_id: str, job: dict, data: dict,
         "components": len(result.components),
         "uncertainties": job["data"]["uncertainties"],
         "changes": len(job.get("changes", [])),
+        "bom_release": audit["bom_release"],
+        "read_report": audit["read_report"],
+        "release_checks": audit["release_checks"],
     })
     job["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_job(job_id)

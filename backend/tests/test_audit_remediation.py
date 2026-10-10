@@ -447,6 +447,9 @@ class TestAuditRemediation(unittest.TestCase):
         self.assertEqual(c_map["-1WL3"].breaker, "CDB6-63 C32")
         self.assertIn("W1", c_map)
         self.assertEqual(c_map["W1"].breaker, "3VA11 100A 3P")
+        self.assertEqual(c_map["W1"].phase, "L1/L2/L3")
+        self.assertEqual(c_map["P1"].phase, "L1/L2/L3")
+        self.assertEqual(c_map["1WL1"].phase, "L1")
         self.assertIn("P1", c_map)
         self.assertEqual(c_map["P1"].breaker, "Tmax XT2 160A")
 

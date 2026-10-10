@@ -52,6 +52,11 @@ class Evidence(BaseModel):
     bbox: Optional["BBox"] = Field(None, description="图元规范页面归一化坐标")
     confidence: float = Field(1.0, ge=0.0, le=1.0, description="证据可信度")
     origin: str = Field("", description="证据来源：cad_native / ocr / human / model_vision。空值视为来源不明，不得用于放行物理事实字段")
+    file_sha256: str = Field("", description="来源文件哈希。空值表示这份证据还没绑到某次交付文件")
+    handle: str = Field("", description="CAD 实体 handle。不能单独当作实例身份")
+    owner: str = Field("", description="模型空间或块名")
+    insert_path: str = Field("", description="块插入路径。同一块的不同插入必须不同")
+    layout: str = Field("", description="布局名，模型空间为 Model")
 
     @property
     def is_physical_fact(self) -> bool:
@@ -218,8 +223,10 @@ class Box(BaseModel):
     install: str = Field("", description="安装方式,如 底边距地1.5m明装")
     location: str = Field("", description="安装位置")
     size: str = Field("", description="参考尺寸")
-    quantity: int = Field(1, description="数量(台)")
+    quantity: int = Field(1, description="数量(台)。台数未标明时这里只表示单箱候选")
+    quantity_confirmed: bool = Field(True, description="台数是否由图面明示。未明示时不得把 quantity 当成项目总量")
     note: str = Field("", description="备注")
+    bbox: Optional[BBox] = Field(None, description="箱体在图纸页内的归一化位置，定位不到留空")
     claims: Dict[str, GroundedField] = Field(default_factory=dict, description="带证据链支撑的结构化字段字典")
 
     @field_validator("code")
@@ -345,6 +352,13 @@ class AssembledMeta(BaseModel):
     contract_version: str = CONTRACT_VERSION
 
 
+class BomRelease(BaseModel):
+    """项目总量能不能放行。单箱候选可以先给出，未知总量不写成 0 或已确认合计。"""
+    project_total_released: bool = True
+    blocked_boxes: List[str] = Field(default_factory=list)
+    reasons: List[str] = Field(default_factory=list)
+
+
 class ExtractionResult(BaseModel):
     title: str = Field("配电箱元器件清单(报价用)", description="清单标题")
     boxes: List[Box] = Field(default_factory=list)
@@ -355,5 +369,6 @@ class ExtractionResult(BaseModel):
     topology: List[DistributionNode] = Field(default_factory=list, description="配电系统拓扑树")
     reconciliation: Optional[CatalogReconciliation] = Field(None, description="图纸目录对账审计结果")
     evidence_store: Dict[str, Evidence] = Field(default_factory=dict, description="证据存储字典")
+    bom_release: BomRelease = Field(default_factory=BomRelease)
     meta: AssembledMeta = Field(default_factory=AssembledMeta)
 

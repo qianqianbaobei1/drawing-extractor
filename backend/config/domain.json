@@ -17,6 +17,7 @@
       "接地平面",
       "防雷平面",
       "电缆敷设",
+      "示意图",
       "管线综合",
       "抗震说明",
       "设计说明",
@@ -38,7 +39,73 @@
       "电表箱",
       "配电屏",
       "开关箱",
-      "电源箱"
+      "电源箱",
+      "总箱"
+    ],
+    "caption_route_marks": ["由", "引", "至", "沿", "敷设"],
+    "wire_kind_words": [
+      "信号线",
+      "电源线",
+      "控制线",
+      "通讯线",
+      "总线"
+    ],
+    "breaker_legend_marks": [
+      "图中",
+      "表示"
+    ],
+    "measure_column_marks": [
+      "Ir",
+      "Ic",
+      "Pe",
+      "Pc",
+      "kVar",
+      "功率因数"
+    ],
+    "spd_family_patterns": [
+      "SPD",
+      "浪涌",
+      "电涌",
+      "CPM-R\\d+",
+      "iPR[DU]",
+      "(?<![A-Z])OVR\\d"
+    ],
+    "spd_class_regex": "^(?:I{1,3}|Ⅰ|Ⅱ|Ⅲ)级[-/]?[1-4]P$",
+    "row_device_families": {
+      "contactor": ["(?<![A-Z0-9])LC1(?:-[A-Z]|D)"],
+      "thermal": ["(?<![A-Z0-9])LRD[-\\s]", "(?<![A-Z0-9])LDR[-\\s]", "(?<![A-Z0-9])LR9[-\\s]"],
+      "ct": ["(?<![A-Z0-9])BH-0\\.66"]
+    },
+    "thermal_setting_regex": "^\\d+~\\d+A$",
+    "table_field_labels": [
+      "设备编号",
+      "箱体编号",
+      "设备名称",
+      "安装位置",
+      "安装方式",
+      "用途",
+      "备注",
+      "小室高度",
+      "计算",
+      "负荷",
+      "数量",
+      "安装高度",
+      "防护等级",
+      "防水型"
+    ],
+    "load_name_reject_substrings": [
+      "过载",
+      "试验",
+      "内配",
+      "距地",
+      "米安装",
+      "梁下",
+      "余同",
+      "功率因数",
+      "kVar",
+      "消防标志",
+      "防火处理",
+      "采用"
     ],
     "unit_caption_bad_layers": [
       "TEL_TAB",
@@ -147,8 +214,8 @@
     "_comment": "断路器型号词法与分类。category_prefixes 按顺序精确匹配型号开头；category_rules 按顺序做包含/前缀判定。",
     "model_prefixes": "MCB|MCCB|RCBO|ACB|ATSE|ATS|SPD|IS\\-|DS\\-|GL\\-|HD\\-|HS\\-|NH40|GL|iC65|C65|Acti9|EA9|Easy9|NSX|NS|CVS|EZD|MTZ|MVS|Compact|NM\\d+|NXB|NB1|NXBLE|NM8|CDM\\d+|NM1|NZ7|NDQ|CDB6|CDG\\d+|CDB\\d+|CDM\\d+|NDM\\d+|NDB\\d+|NDQ\\d+|NDW\\d+|S200|S280|Tmax|XT\\d+|Emax|Formula|5SY\\d+|5SL\\d+|3VA\\d+|3VM\\d+|3WL\\d+|DZ\\d+|CM\\d+|TM\\d+|DW\\d+|CW\\d+|RMW\\d+",
     "model_regex_template": "^(?:内配\\s*)?(?:{prefixes})",
-    "fallback_regex": "(?:RCBO/[1234]P|(?:MCB|MCCB|ACB|ATSE|ATS|SPD)-[A-Z0-9/]+|\\b[CDB]\\d{1,3}A?(?:/[1-4]P|\\b)|\\b\\d{1,4}A/[1-4]P|In\\s*=\\s*\\d{1,4}A)",
-    "disallowed_prefixes_regex": "^(?:SC|PC|KBG|JDG|CT|FC|WC|CC|WS|BV|BVR|YJV|KVV|RVV|WDZ|ZR|NH|ZA|ZB|ZC|BBTRZ|IP\\d|GB|JGJ|CECS|ISO|IEC|MCB|MCCB|RCBO|ACB|ATSE|SPD|C65|NSX|EZD|iC65|DZ47|NM1|CM1)",
+    "fallback_regex": "(?:RCBO/[1234]P|(?:MCB|MCCB|ACB|ATSE|ATS|SPD)-[A-Z0-9/]+|(?<![A-Za-z0-9\\-])[CDB]\\d{1,3}A?(?:/[1-4]P|(?![A-Za-z0-9\\-]))|\\b\\d{1,4}A/[1-4]P|In\\s*=\\s*\\d{1,4}A)",
+    "disallowed_prefixes_regex": "^(?:SC|PC|KBG|JDG|CT|FC|WC|CC|WS|BV|BVR|YJV|KVV|RVV|WDZ|ZR|NH|ZA|ZB|ZC|BBTRZ|IP\\d|GB|JGJ|CECS|ISO|IEC|MCB|MCCB|RCBO|ACB|ATSE|SPD|C65|NSX|EZD|iC65|DZ47|NM1|CM1|ESB)",
     "category_prefixes": [
       [
         "MCB",
@@ -270,12 +337,12 @@
     "other_category": "断路器（其他）"
   },
   "vocabulary": {
-    "circuit_no_regex": "^(?:(?:[A-Z0-9]+[-_])+(?:WL|WP|WX|WD|WS|WY|W|P|N|E|C|QF)\\d+[A-Z]?|(?:(?:B?\\d+|\\-\\d+)[-_]?)?(?:WL|WP|WX|WD|WS|WY|WE|W|P|N|E|QF)\\d+(?:[-_]\\d+|[A-Z])?|(?:PY|BF|XF|FS|FP|XP|ZL)[-_][A-Z0-9]+(?:[-_][A-Z0-9]+)*)$",
-    "phase_regex": "^(L[123NPE~,\\.\\-\\s/]+|380/220V|220V|380V)$",
+    "circuit_no_regex": "^(?:(?:[A-Z0-9]+[-_])+(?:WL|WP|WX|WD|WS|WY|QF)\\d+[A-Z]?|(?:(?:B?\\d{1,2}|\\-\\d{1,2})[-_]?)?(?:WL|WP|WX|WD|WS|WY|WE|W|P|N|E|QF)\\d+(?:[-_]\\d+|[A-Z])?|(?:PY|BF|XF|FS|FP|XP|ZL)[-_][A-Z0-9]+(?:[-_][A-Z0-9]+)*)$",
+    "phase_regex": "^(?:L[123](?:[,./\\-\\s]*L?[123NPE~])*|380/220V|220V|380V)$",
     "power_regex": "^(\\d+(\\.\\d+)?\\s*kW(\\s*x\\s*\\d+)?|Pe\\s*=\\s*\\d+(\\.\\d+)?\\s*kW)$",
     "current_regex": "^(\\d+(\\.\\d+)?\\s*A|\\d+~\\d+A)$",
-    "cable_regex": "^(ZR|NH|WDZ|WDZN|ZA|ZB|ZC)?[\\-\\s]*(YJV|BV|BVR|RVV|KVV|BBTRZ)[\\-\\s\\d/]+.*",
-    "engineering_unit_regex": "^\\d+(?:\\.\\d+)?(?:A|kA|kW|W|V|kV|Hz|kVA|VA|mm|m|min|h|s|lx|lm|kN|MPa|dB)$",
+    "cable_regex": "^(ZR|NH|WDZ|WDZN|ZA|ZB|ZC)?[\\-\\s]*(YJV|YJY|BV|BVR|BYJ|RVV|KVV|BBTRZ)[\\-\\s\\d/]+.*",
+    "engineering_unit_regex": "^\\d+(?:\\.\\d+)?(?:A|kA|kW|kVar|W|V|kV|Hz|kVA|VA|mm|m|min|h|s|lx|lm|kN|MPa|dB)$",
     "national_atlas_regex": "^\\d{2}[A-Z]{1,2}\\d{3}(-\\d+)?$",
     "circuit_no_max_digits": 4,
     "non_panel_token_regexes": [
@@ -284,9 +351,14 @@
       "^\\d{1,4}\\s*(?:HZ|H)$",
       "^\\d+(?:\\.\\d+)?\\s*K?W$",
       "^\\d+\\s*(?:KA|MA)$",
-      "^\\d{1,2}\\s*[X×]\\s*\\d+(?:\\.\\d+)?\\s*(?:A|MM2?)?$"
+      "^\\d{1,2}\\s*[X×]\\s*\\d+(?:\\.\\d+)?\\s*(?:A|MM2?)?$",
+      "^\\d{1,3}P\\d{1,3}$",
+      "^[1-4]P$",
+      "^RS\\d{3}$",
+      "^[A-Z]{1,4}\\d{0,2}-[A-Z]\\d{2,3}[A-Z]{0,3}$",
+      "^[A-Z]{3,}\\d+[A-Z]+\\d+[A-Z]+(?:[-/][A-Z0-9]+)*$"
     ],
-    "non_panel_token_comment": "电压/频率/功率这类工程量的写法，单独成文时不是箱号。若某项目确有形如 B1 的短箱号被误判，请在此按项目补正则（不要直接改代码）。"
+    "non_panel_token_comment": "电压/频率/功率、接触器框架号（如 LC1-D09C）、字母与数字交错的设备样本编号（如 HND07E3Y/K）单独成文时不是箱号。"
   },
   "categories": {
     "order": [
@@ -360,8 +432,12 @@
       "\\b((?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?BV)(?=[-_\\s\\d*(×x]|$)",
       "\\b((?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?RVVP?)(?=[-_\\s\\d*(×x]|$)"
     ],
+    "signal_family_patterns": [
+      "(?:WDZ[A-Z]*|ZR[A-Z]*|NH[A-Z]*|FS)?-?(?:RYJS|RVVP|RVSP|KVVP|KVV|DJYVP)(?=[-_\\s\\d*(×x]|$)"
+    ],
     "laying_method_regex": "(?:-|/|\\s|^)((?:SC|PC|KBG|JDG|CT|MR|PR|CP|RC|PVC)\\d{0,3}(?:[/-](?:CC|WC|FC|WS|CE|ACC|SR|MR|CT|WE))*)\\b",
-    "default_laying": "未标注"
+    "default_laying": "未标注",
+    "inline_markers": ["BV", "BVR", "BYJ", "YJV", "YJY", "RVV", "KVV", "WDZ", "BBTRZ"]
   },
   "review": {
     "confirmed_prefix": "（已确认）",
@@ -524,6 +600,9 @@
       "控制电路",
       "原理图",
       "二次接线"
-    ]
+    ],
+    "link_pattern_template": "(?:^|至|送|往|引至|供|接|配电箱|\\b){code}(?:配电箱|分箱|箱|柜|照明箱|动力箱|\\b|$|\\s)",
+    "upstream_unnamed_markers": ["上级", "引自", "引来"],
+    "upstream_unnamed_note": "上级箱号未在图中标明"
   }
 }
