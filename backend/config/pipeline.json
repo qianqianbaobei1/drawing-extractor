@@ -41,9 +41,9 @@
     "frame_dedup_tol": 0.02,
     "frame_dup_tol": 10.0,
     "unit_rect_min_w": 3500.0,
-    "unit_rect_max_w": 48000.0,
+    "unit_rect_max_w": 100000.0,
     "unit_rect_min_h": 3000.0,
-    "unit_rect_max_h": 52000.0,
+    "unit_rect_max_h": 140000.0,
     "unit_rect_dedup_tol": 200.0,
     "rect_aspect_min": 1.05,
     "rect_aspect_max": 2.4,
@@ -140,7 +140,12 @@
     "circuit_row_spacing_factor": 0.45,
     "preview_bbox_pad": 0.015,
     "preview_bbox_min": 0.04,
-    "preview_bbox_fallback": [0.05, 0.05, 0.9, 0.9],
+    "preview_bbox_fallback": [
+      0.05,
+      0.05,
+      0.9,
+      0.9
+    ],
     "quantity_warning_aggregate_min": 8,
     "header_row_dy_heights": 1.2,
     "header_caption_dx_heights": 40,
@@ -157,7 +162,9 @@
     "row_device_baseline_heights": 2,
     "power_label_gap_heights": 12,
     "spd_owner_heights": 32,
-    "spd_class_gap_heights": 4
+    "spd_class_gap_heights": 4,
+    "box_side_gap_max": 15000.0,
+    "box_side_y_pad": 2000.0
   },
   "gates": {
     "_comment": "原生 CAD 提取结果进入流水线的准入条件；不达标即回退视觉大模型。",

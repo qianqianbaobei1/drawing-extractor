@@ -701,6 +701,8 @@ CAPTION_TAIL_STRIP_REGEXES = tuple(
 UNIT_RECT_BAD_LAYER_MARKERS = tuple(_DOM["unit_rect_bad_layer_markers"])
 BOX_ABOVE_MIN, BOX_ABOVE_MAX = float(_CAD["box_above_min"]), float(_CAD["box_above_max"])
 BOX_X_TOLERANCE = float(_CAD["box_x_tolerance"])       # 箱名与箱框水平中心的最大额外偏移
+BOX_SIDE_GAP_MAX = float(_CAD.get("box_side_gap_max") or 15000.0)  # 箱名在箱框左右侧时的最大缝隙
+BOX_SIDE_Y_PAD = float(_CAD.get("box_side_y_pad") or 2000.0)       # 侧旁配对允许的垂直越界
 CROP_PAD_SIDE = float(_CAD["crop_pad_side"])
 CROP_PAD_TOP = float(_CAD["crop_pad_top"])
 CROP_PAD_BOTTOM = float(_CAD["crop_pad_bottom"])
@@ -1295,7 +1297,7 @@ def _unit_rects(index: GeometryIndex, frame_rect) -> list[tuple[float, float, fl
 
 
 def _match_box_rect(rects, cap) -> tuple[float, float, float, float] | None:
-    """给箱名文字找它所属的箱框：优先“包含箱名”的最大外框，否则找正上方最近的框。"""
+    """给箱名找箱框：内含 → 正上方 → 左右侧旁（Y 重叠）。"""
     cx, cy = cap["x"], cap["y"]
     inside = [r for r in rects if r[0] <= cx <= r[2] and r[1] <= cy <= r[3]]
     if inside:
@@ -1309,11 +1311,27 @@ def _match_box_rect(rects, cap) -> tuple[float, float, float, float] | None:
         if abs(cx - (r[0] + r[2]) / 2.0) > half:
             continue
         cands.append((abs(dy) if dy >= 0 else dy + 1e6, r))
-    if not cands:
+    if cands:
+        min_dy = min(c[0] for c in cands)
+        best_cands = [c[1] for c in cands if abs(c[0] - min_dy) < 500.0]
+        return max(best_cands, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+    # 侧旁：箱名在框左右，垂直方向与框重叠（消控 03ELB1 等）
+    side = []
+    for r in rects:
+        if not (r[1] - BOX_SIDE_Y_PAD <= cy <= r[3] + BOX_SIDE_Y_PAD):
+            continue
+        if cx < r[0]:
+            gap = r[0] - cx
+        elif cx > r[2]:
+            gap = cx - r[2]
+        else:
+            continue
+        if gap <= BOX_SIDE_GAP_MAX:
+            side.append((gap, r))
+    if not side:
         return None
-    min_dy = min(c[0] for c in cands)
-    best_cands = [c[1] for c in cands if abs(c[0] - min_dy) < 500.0]
-    return max(best_cands, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+    side.sort(key=lambda x: (x[0], -(x[1][2] - x[1][0]) * (x[1][3] - x[1][1])))
+    return side[0][1]
 
 
 def _column_pitch(rects) -> float:

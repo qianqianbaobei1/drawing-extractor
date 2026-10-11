@@ -487,6 +487,40 @@ class TestUnitBlockSplitHardening(unittest.TestCase):
         self.assertEqual(blocks[0]["box_code"], "03XF01")
         self.assertEqual(blocks[0]["split_source"], "unit")
 
+    def test_side_caption_matches_unit_rect(self):
+        """箱名在箱框右侧（Y 重叠）也应配上，覆盖消控 03ELB1 类版式。"""
+        from extractor.cad import GeometryIndex, build_unit_blocks
+        doc, msp = self._frame_doc()
+        x, y = 5000, 35000
+        msp.add_lwpolyline([(x, y), (x + 15000, y), (x + 15000, y + 20000), (x, y + 20000)],
+                           close=True, dxfattribs={"layer": "强电系统", "linetype": "DASHED2"})
+        # 箱名在框右侧中部，不在框下
+        msp.add_text("应急照明箱03ELB1", dxfattribs={
+            "height": 300, "insert": (x + 15000 + 4000, y + 10000), "layer": "强电系统"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["split_source"], "unit")
+        self.assertEqual(blocks[0]["box_code"], "03ELB1")
+
+    def test_oversized_containing_rect_builds_unit(self):
+        """单箱系统图外框偏大（>旧 48k）但箱名落在框内时仍应成单元。"""
+        from extractor.cad import GeometryIndex, build_unit_blocks
+        doc, msp = self._frame_doc()
+        # 约 60k x 70k，超过旧上限 48k/52k，落在新上限内
+        x, y = 10000, 5000
+        msp.add_lwpolyline([(x, y), (x + 60000, y), (x + 60000, y + 70000), (x, y + 70000)],
+                           close=True, dxfattribs={"layer": "0", "linetype": "DASHED2"})
+        msp.add_text("路灯照明配电箱00ALZ", dxfattribs={
+            "height": 400, "insert": (x + 20000, y + 5000), "layer": "电气"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["split_source"], "unit")
+        self.assertEqual(blocks[0]["box_code"], "00ALZ")
+
 
 class TestDwgConversionGuard(unittest.TestCase):
     """DWG 转 DXF 只认本图产物，坏文件不能冒充另一张配电箱图。"""
