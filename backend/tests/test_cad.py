@@ -504,6 +504,25 @@ class TestUnitBlockSplitHardening(unittest.TestCase):
         self.assertEqual(blocks[0]["split_source"], "unit")
         self.assertEqual(blocks[0]["box_code"], "03ELB1")
 
+    def test_coded_caption_beats_placeholder_on_same_rect(self):
+        """同一箱框上 XXM 占位名不得抢走带真实箱号的侧旁箱名。"""
+        from extractor.cad import GeometryIndex, build_unit_blocks
+        doc, msp = self._frame_doc()
+        x, y = 5000, 35000
+        msp.add_lwpolyline([(x, y), (x + 15000, y), (x + 15000, y + 20000), (x, y + 20000)],
+                           close=True, dxfattribs={"layer": "强电系统", "linetype": "DASHED2"})
+        # 占位名 Y 更高，旧排序会先抢走框
+        msp.add_text("XXM 照明配电箱", dxfattribs={
+            "height": 300, "insert": (x + 2000, y + 18000), "layer": "强电系统"})
+        msp.add_text("应急照明箱03ELB1", dxfattribs={
+            "height": 300, "insert": (x + 15000 + 4000, y + 10000), "layer": "强电系统"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["box_code"], "03ELB1")
+        self.assertNotIn("XXM", blocks[0]["label"])
+
     def test_oversized_containing_rect_builds_unit(self):
         """单箱系统图外框偏大（>旧 48k）但箱名落在框内时仍应成单元。"""
         from extractor.cad import GeometryIndex, build_unit_blocks

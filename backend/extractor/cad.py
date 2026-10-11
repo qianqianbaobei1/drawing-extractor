@@ -1519,7 +1519,12 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
         made = 0
         used: set[int] = set()
         matched_ids: set[int] = set()
-        for cap in sorted(captions, key=lambda t: (-t["y"], t["x"])):
+        # 带真实箱号的 caption 优先抢框，避免「XXM 照明配电箱」占走 03ELB1 的侧旁框
+        def _cap_sort_key(t: dict[str, Any]):
+            has_code = 1 if _caption_panel_code(t["text"]) else 0
+            return (-has_code, -t["y"], t["x"])
+
+        for cap in sorted(captions, key=_cap_sort_key):
             rect = _match_box_rect(rects, cap)
             if rect is None or id(rect) in used:
                 continue
