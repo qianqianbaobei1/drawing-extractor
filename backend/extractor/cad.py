@@ -689,6 +689,14 @@ CAPTION_ROUTE_MARKS = tuple(_DOM.get("caption_route_marks") or ("由", "引", "�
 CAPTION_STRIP_MARKS = tuple(_DOM.get("caption_strip_marks") or ("系统图", "接线图", "原理图"))
 CAPTION_BAD_HEAD_CHARS = str(_DOM.get("caption_bad_head_chars") or "由详注如按本除并引至沿")
 CAPTION_SOFT_TAIL_CHARS = str(_DOM.get("caption_soft_tail_chars") or "箱柜屏盘")
+CAPTION_NOTE_MARKS = tuple(
+    _DOM.get("caption_note_marks")
+    or ("详见", "配置详见", "各配电箱", "各配电柜", "应符合", "不得", "本说明", "参见")
+)
+CAPTION_TAIL_STRIP_REGEXES = tuple(
+    _DOM.get("caption_tail_strip_regexes")
+    or (r"共\d+台.*$", r"(?:挂墙|壁挂|落地|明装|暗装|嵌墙).*$")
+)
 # 平面图/建筑图层上也有闭合箱柜外形，但不是系统图单元块，按图层前缀排掉
 UNIT_RECT_BAD_LAYER_MARKERS = tuple(_DOM["unit_rect_bad_layer_markers"])
 BOX_ABOVE_MIN, BOX_ABOVE_MAX = float(_CAD["box_above_min"]), float(_CAD["box_above_max"])
@@ -961,18 +969,49 @@ def _guess_plot_scale(w: float, h: float) -> float:
 
 
 def _normalize_box_caption(text: str) -> str:
-    """去掉空格、括号修饰与「系统图」等图类尾巴，便于后缀匹配。"""
+    """去掉空格、括号修饰、「系统图」尾巴，以及「共N台/挂墙」安装尾注。"""
     t = re.sub(r"\s+", "", (text or "").strip())
     t = re.sub(r"[（(][^）)]*[）)]", "", t)
     for mark in CAPTION_STRIP_MARKS:
         if mark and mark in t:
             t = t.replace(mark, "")
+    for pat in CAPTION_TAIL_STRIP_REGEXES:
+        if pat:
+            t = re.sub(pat, "", t)
+    # 「配电总箱1」这类序号尾巴：只剥箱种后缀后的纯数字，不动 00ALZ 这类代号
+    for sfx in UNIT_CAPTION_SUFFIX:
+        m = re.search(re.escape(sfx) + r"(\d+)$", t)
+        if m:
+            t = t[: m.start(1)]
+            break
     return t.strip(" -_/、，,")
 
 
+def _is_caption_trailing_code(token: str) -> bool:
+    """箱种后缀后的代号：00ALZ / JXX2 / 03ELB1；拒绝纯数字与回路号。"""
+    tok = (token or "").strip(" -_/")
+    if not tok or len(tok) > 16:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", tok):
+        return False
+    if not re.search(r"[A-Za-z]", tok):
+        return False
+    if _looks_like_circuit_code(tok):
+        return False
+    return True
+
+
 def _caption_suffix_match(text: str) -> str | None:
+    """标准后缀：优先末尾匹配；也允许「…配电箱00ALZ」这种代号在后缀后。"""
     for sfx in UNIT_CAPTION_SUFFIX:
         if text.endswith(sfx):
+            return sfx
+    for sfx in UNIT_CAPTION_SUFFIX:
+        idx = text.rfind(sfx)
+        if idx < 0:
+            continue
+        after = text[idx + len(sfx):]
+        if after and _is_caption_trailing_code(after):
             return sfx
     return None
 
@@ -986,13 +1025,21 @@ def _caption_has_route_note(text: str) -> bool:
     return any(mark and raw.startswith(mark) for mark in CAPTION_ROUTE_MARKS)
 
 
-def _looks_like_box_caption(text: str) -> bool:
-    """箱名判定：标准后缀最长匹配；无标准后缀时允许「代号+箱/柜/屏/盘」。
+def _caption_has_note_mark(text: str) -> bool:
+    """说明句/注释不当箱名：配置详见各配电箱柜系统图 等。"""
+    compact = re.sub(r"\s+", "", (text or "").strip())
+    if not compact:
+        return True
+    return any(m and m in compact for m in CAPTION_NOTE_MARKS)
 
-    图名（系统图/平面图等）且抽不出箱号时不当箱名；「由/引…」路由注释直接拒绝。
+
+def _looks_like_box_caption(text: str) -> bool:
+    """箱名判定：标准后缀最长匹配；允许代号在后缀后；拒说明句与路由注释。
+
+    图名（系统图/平面图等）且抽不出箱号时不当箱名。
     """
     raw = (text or "").strip()
-    if not raw or _caption_has_route_note(raw):
+    if not raw or _caption_has_route_note(raw) or _caption_has_note_mark(raw):
         return False
     compact = re.sub(r"\s+", "", raw)
     # 纯图名：带系统图/平面图类词且没有箱种后缀 → 不是箱名
@@ -1002,7 +1049,14 @@ def _looks_like_box_caption(text: str) -> bool:
         return False
     sfx = _caption_suffix_match(t)
     if sfx:
-        head = t[: -len(sfx)].strip(" -_/")
+        idx = t.rfind(sfx)
+        head = t[:idx].strip(" -_/")
+        after = t[idx + len(sfx):]
+        if after and _is_caption_trailing_code(after):
+            # 「路灯照明配电箱00ALZ」：代号在后，head 可空；head 有内容时仍拒坏首字
+            if head and head[0] in CAPTION_BAD_HEAD_CHARS:
+                return False
+            return True
         if not head or head[0] in CAPTION_BAD_HEAD_CHARS:
             return False
         return True
@@ -1360,11 +1414,38 @@ def _caption_leading_code(caption: str) -> str | None:
     return None
 
 
+def _caption_trailing_code(caption: str) -> str | None:
+    """从「…配电箱00ALZ / 应急照明箱03ELB1」后缀后抽出代号。"""
+    from .cad_extractor import extract_panel_code
+    t = _normalize_box_caption(caption or "")
+    if not t:
+        return None
+    for sfx in UNIT_CAPTION_SUFFIX:
+        idx = t.rfind(sfx)
+        if idx < 0:
+            continue
+        after = t[idx + len(sfx):]
+        if not _is_caption_trailing_code(after):
+            continue
+        code = extract_panel_code(after)
+        if code and not _looks_like_circuit_code(code):
+            return code
+        token = after.upper()
+        if re.search(r"[A-Z]", token) and re.search(r"\d", token) and not _looks_like_circuit_code(token):
+            return token
+    return None
+
+
+def _caption_panel_code(caption: str) -> str | None:
+    """caption 上的箱号：前缀优先，其次后缀后代号。"""
+    return _caption_leading_code(caption) or _caption_trailing_code(caption)
+
+
 def _extract_unit_box_code(crop_texts: list[dict[str, Any]], caption: str | None = None) -> str | None:
     """从单元块文本中提取配电箱编号；caption 优先，拒绝回路号抢码。"""
     from .cad_extractor import extract_panel_code
     if caption:
-        code = _caption_leading_code(caption)
+        code = _caption_panel_code(caption)
         if code:
             return code
     for t in crop_texts:

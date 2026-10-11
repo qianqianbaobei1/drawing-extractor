@@ -437,6 +437,56 @@ class TestUnitBlockSplitHardening(unittest.TestCase):
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0]["split_source"], "unit")
 
+    def test_trailing_code_caption_and_reject_note(self):
+        """现场写法：箱种后缀后跟箱号；说明句「配置详见…」不得当箱名。"""
+        from extractor.cad import (
+            GeometryIndex, build_unit_blocks, _looks_like_box_caption, _extract_unit_box_code,
+        )
+        self.assertTrue(_looks_like_box_caption("路灯照明配电箱00ALZ"))
+        self.assertTrue(_looks_like_box_caption("应急照明箱03ELB1"))
+        self.assertTrue(_looks_like_box_caption("检修电源配电箱JXX2"))
+        self.assertTrue(_looks_like_box_caption("02AP01 配电总箱1"))
+        self.assertTrue(_looks_like_box_caption("03XF01消防配电箱 共1台,（挂墙明装）"))
+        self.assertFalse(_looks_like_box_caption("配置详见各配电箱柜系统图"))
+        self.assertEqual(_extract_unit_box_code([], caption="路灯照明配电箱00ALZ"), "00ALZ")
+        self.assertEqual(_extract_unit_box_code([], caption="应急照明箱02YJ01"), "02YJ01")
+        self.assertEqual(_extract_unit_box_code([], caption="检修电源配电箱JXX2"), "JXX2")
+        self.assertEqual(_extract_unit_box_code([], caption="03XF01消防配电箱 共1台,（挂墙明装）"), "03XF01")
+
+        doc, msp = self._frame_doc()
+        # 左：真箱名（后缀后箱号）；右：说明句误匹配候选
+        x1, y1 = 5000, 35000
+        msp.add_lwpolyline([(x1, y1), (x1 + 15000, y1), (x1 + 15000, y1 + 20000), (x1, y1 + 20000)],
+                           close=True, dxfattribs={"layer": "强电系统", "linetype": "DASHED2"})
+        msp.add_text("路灯照明配电箱00ALZ", dxfattribs={"height": 300, "insert": (x1 + 2000, 33800), "layer": "强电系统"})
+        x2, y2 = 45000, 35000
+        msp.add_lwpolyline([(x2, y2), (x2 + 15000, y2), (x2 + 15000, y2 + 20000), (x2, y2 + 20000)],
+                           close=True, dxfattribs={"layer": "强电系统", "linetype": "DASHED2"})
+        msp.add_text("配置详见各配电箱柜系统图", dxfattribs={"height": 300, "insert": (x2 + 2000, 33800), "layer": "文字层"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["split_source"], "unit")
+        self.assertEqual(blocks[0]["box_code"], "00ALZ")
+        self.assertNotIn("配置详见", blocks[0]["label"])
+
+    def test_qty_tail_stripped_caption_builds_unit(self):
+        """「03XF01消防配电箱 共1台」应剥尾注后成单元，并抽出 03XF01。"""
+        from extractor.cad import GeometryIndex, build_unit_blocks
+        doc, msp = self._frame_doc()
+        x, y = 5000, 35000
+        msp.add_lwpolyline([(x, y), (x + 15000, y), (x + 15000, y + 20000), (x, y + 20000)],
+                           close=True, dxfattribs={"layer": "强电系统", "linetype": "DASHED2"})
+        msp.add_text("03XF01消防配电箱 共1台,（挂墙明装）",
+                     dxfattribs={"height": 300, "insert": (x + 2000, 33800), "layer": "强电系统"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["box_code"], "03XF01")
+        self.assertEqual(blocks[0]["split_source"], "unit")
+
 
 class TestDwgConversionGuard(unittest.TestCase):
     """DWG 转 DXF 只认本图产物，坏文件不能冒充另一张配电箱图。"""

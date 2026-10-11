@@ -210,7 +210,7 @@
       "就地控制箱"
     ],
     "box_caption_min_len": 3,
-    "box_caption_max_len": 26,
+    "box_caption_max_len": 32,
     "box_title_max_len": 30,
     "note_text_max_len": 35,
     "title_layer_score_hints": {
@@ -240,7 +240,22 @@
       "结线图"
     ],
     "caption_bad_head_chars": "由详注如按本除并引至沿",
-    "caption_soft_tail_chars": "箱柜屏盘"
+    "caption_soft_tail_chars": "箱柜屏盘",
+    "caption_note_marks": [
+      "详见",
+      "配置详见",
+      "各配电箱",
+      "各配电柜",
+      "应符合",
+      "不得",
+      "本说明",
+      "参见",
+      "参照图集"
+    ],
+    "caption_tail_strip_regexes": [
+      "共\\d+台.*$",
+      "(?:挂墙|壁挂|落地|明装|暗装|嵌墙).*$"
+    ]
   },
   "breaker": {
     "_comment": "断路器型号词法与分类。category_prefixes 按顺序精确匹配型号开头；category_rules 按顺序做包含/前缀判定。",
