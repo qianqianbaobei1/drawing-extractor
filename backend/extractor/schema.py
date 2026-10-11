@@ -292,6 +292,11 @@ class CatalogItem(BaseModel):
     matched_panels: List[str] = Field(default_factory=list, description="实际已提取到的配电箱")
     missing_panels: List[str] = Field(default_factory=list, description="缺失未进流水线的配电箱")
     status: str = Field("COVERED", description="COVERED(全部覆盖) / PARTIAL(部分覆盖) / MISSING(整张图幅缺失)")
+    declaration_kind: str = Field(
+        "",
+        description="sheet_catalog=图纸目录行; range_annotation=平面/表栏范围声明; caption=箱名声明",
+    )
+    note: str = Field("", description="对账备注，如「目录声明、图面未切出单元」")
 
 
 class CatalogReconciliation(BaseModel):

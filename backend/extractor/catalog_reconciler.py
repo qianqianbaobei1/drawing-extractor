@@ -93,8 +93,12 @@ def expand_panel_range(text: str) -> list[str]:
         end_n = int(match.group(2))
         suffix = match.group(3)
         if 0 < end_n - start_n <= 150 and start_n > 0:
+            # 仅当起始数字本身带前导零时保留位宽（DQHZ01）；3~10RDAL 不补零
+            raw_start = match.group(1)
+            width = len(raw_start) if raw_start != str(start_n) else 0
             for i in range(start_n, end_n + 1):
-                add_code(f"{i}{suffix}")
+                num = str(i).zfill(width) if width else str(i)
+                add_code(f"{num}{suffix}")
             remaining_text = remaining_text.replace(match.group(0), " ")
 
     for match in range_regex.finditer(cleaned):
@@ -114,8 +118,10 @@ def expand_panel_range(text: str) -> list[str]:
                 end_n = int(num2_str)
                 # 范围需 end_n > start_n，且跨度合理 (1 ~ 150)
                 if 0 < end_n - start_n <= 150 and start_n > 0:
+                    width = len(num1_str) if num1_str != str(start_n) else 0
                     for i in range(start_n, end_n + 1):
-                        add_code(f"{effective_prefix}{i}")
+                        num = str(i).zfill(width) if width else str(i)
+                        add_code(f"{effective_prefix}{num}")
                     remaining_text = remaining_text.replace(match.group(0), " ")
             except ValueError:
                 pass
@@ -127,6 +133,49 @@ def expand_panel_range(text: str) -> list[str]:
 
     return results
 
+
+
+
+def harvest_range_annotations(texts: Iterable[str]) -> list[CatalogItem]:
+    """从平面图/表栏文字中收获范围声明（DQHZ01~DQHZ05 等），不假装切块。
+
+    只收「含范围符且能展开出 ≥2 个箱号」的行；结果 declaration_kind=range_annotation，
+    对账缺失时文案为「目录声明、图面未切出单元」。
+    """
+    items: list[CatalogItem] = []
+    seen_key: set[str] = set()
+    for raw in texts or []:
+        text = (raw or "").strip()
+        if not text or len(text) > 120:
+            continue
+        if not re.search(r"[~～至到]", text):
+            continue
+        # 说明长句里的范围不是目录
+        if any(m in text for m in ("详见", "应符合", "不得", "采用", "敷设")):
+            continue
+        declared = expand_panel_range(text)
+        if len(declared) < 2:
+            continue
+        # 管径/尺寸噪声：DN65~DN150 等不是配电箱
+        if all(re.fullmatch(r"DN\d+", c, re.I) for c in declared):
+            continue
+        if re.search(r"管径|孔径|间距|长度|宽度|变压器|kVA|KVA|SCZB", text):
+            continue
+        key = ",".join(declared)
+        if key in seen_key:
+            continue
+        seen_key.add(key)
+        items.append(CatalogItem(
+            sheet_no="",
+            sheet_title=text[:80],
+            declared_panels=declared,
+            matched_panels=[],
+            missing_panels=list(declared),
+            status="MISSING",
+            declaration_kind="range_annotation",
+            note="平面/表栏范围声明，展开后参与对账",
+        ))
+    return items
 
 class DrawingCatalogReconciler:
     """图纸目录与实际提取覆盖核对器。"""
@@ -179,6 +228,13 @@ class DrawingCatalogReconciler:
         if not declared:
             return None
 
+        # 带图号/系统图字样 → 图纸目录；纯范围表达式 → 平面/表栏范围声明
+        if sheet_no or any(m in sheet_title for m in ("系统图", "图纸", "目录", "一览")):
+            kind = "sheet_catalog"
+        elif re.search(r"[~～至到]", text) and len(declared) >= 2:
+            kind = "range_annotation"
+        else:
+            kind = "caption"
         return CatalogItem(
             sheet_no=sheet_no,
             sheet_title=sheet_title,
@@ -186,6 +242,8 @@ class DrawingCatalogReconciler:
             matched_panels=[],
             missing_panels=list(declared),
             status="COVERED" if not declared else "MISSING",
+            declaration_kind=kind,
+            note="" if kind != "range_annotation" else "平面/表栏范围声明，展开后参与对账",
         )
 
     @classmethod
@@ -198,12 +256,22 @@ class DrawingCatalogReconciler:
             declared = r.get("declared_panels")
             if declared is None:
                 declared = expand_panel_range(sheet_title)
+            kind = str(r.get("declaration_kind") or "").strip()
+            note = str(r.get("note") or "").strip()
+            if not kind:
+                if re.search(r"[~～至到]", sheet_title) and len(list(declared)) >= 2:
+                    kind = "range_annotation"
+                    note = note or "平面/表栏范围声明，展开后参与对账"
+                else:
+                    kind = "sheet_catalog"
             items.append(CatalogItem(
                 sheet_no=sheet_no,
                 sheet_title=sheet_title,
                 declared_panels=list(declared),
                 missing_panels=list(declared),
                 status="COVERED" if not declared else "MISSING",
+                declaration_kind=kind,
+                note=note,
             ))
         return cls(items)
 
@@ -258,6 +326,12 @@ class DrawingCatalogReconciler:
             else:
                 item_status = "PARTIAL"
 
+            note = item.note or ""
+            kind = getattr(item, "declaration_kind", "") or ""
+            if item_missing and kind == "range_annotation":
+                note = "目录声明、图面未切出单元"
+            elif item_missing and not note:
+                note = "目录声明箱号在本次提取中未命中"
             updated_item = CatalogItem(
                 sheet_no=item.sheet_no,
                 sheet_title=item.sheet_title,
@@ -265,6 +339,8 @@ class DrawingCatalogReconciler:
                 matched_panels=item_matched,
                 missing_panels=item_missing,
                 status=item_status,
+                declaration_kind=kind,
+                note=note,
             )
             processed_items.append(updated_item)
 
@@ -299,15 +375,27 @@ class DrawingCatalogReconciler:
                 sample = ", ".join(item.missing_panels[:5])
                 count = len(item.missing_panels)
                 suffix = f" 等共 {count} 台" if count > 5 else f" (共 {count} 台)"
+                kind = getattr(item, "declaration_kind", "") or ""
+                if kind == "range_annotation":
+                    detail = (
+                        f"【目录声明、图面未切出单元】图面范围声明 "
+                        f"《{item.sheet_title}》展开为配电箱 [{sample}{suffix}]，"
+                        f"但未切出对应单元块（多为平面标注/监控表栏，并非独立系统图）。"
+                        f"请人工确认是否另有系统图，勿当作已扒量。"
+                    )
+                    sev = "WARNING"
+                else:
+                    detail = (
+                        f"【范围缺失】图纸目录声明图幅 {item.sheet_no or '(未标图号)'} "
+                        f"《{item.sheet_title}》包含配电箱 [{sample}{suffix}]，"
+                        f"但在本次提取中全未找到！疑似系统图图幅漏传或未纳入切片范围，请核对补传！"
+                    )
+                    sev = "ERROR"
                 issues.append(
                     Uncertainty(
                         location="图纸目录对账",
-                        detail=(
-                            f"【范围缺失】图纸目录声明图幅 {item.sheet_no or '(未标图号)'} "
-                            f"《{item.sheet_title}》包含配电箱 [{sample}{suffix}]，"
-                            f"但在本次提取中全未找到！疑似系统图图幅漏传或未纳入切片范围，请核对补传！"
-                        ),
-                        severity="ERROR",
+                        detail=detail,
+                        severity=sev,
                         source="program",
                     )
                 )
@@ -315,13 +403,21 @@ class DrawingCatalogReconciler:
                 sample = ", ".join(item.missing_panels[:5])
                 count = len(item.missing_panels)
                 suffix = f" 等共 {count} 台" if count > 5 else f" (共 {count} 台)"
+                kind = getattr(item, "declaration_kind", "") or ""
+                if kind == "range_annotation":
+                    detail = (
+                        f"【目录声明、图面未切出单元】范围声明《{item.sheet_title}》中 "
+                        f"[{sample}{suffix}] 未切出单元块，请人工核对（勿当作已扒量）"
+                    )
+                else:
+                    detail = (
+                        f"【部分缺失】图纸目录声明图幅 {item.sheet_no or ''} "
+                        f"《{item.sheet_title}》中部分配电箱 [{sample}{suffix}] 未提取到，请核对图纸局部"
+                    )
                 issues.append(
                     Uncertainty(
                         location="图纸目录对账",
-                        detail=(
-                            f"【部分缺失】图纸目录声明图幅 {item.sheet_no or ''} "
-                            f"《{item.sheet_title}》中部分配电箱 [{sample}{suffix}] 未提取到，请核对图纸局部"
-                        ),
+                        detail=detail,
                         severity="WARNING",
                         source="program",
                     )

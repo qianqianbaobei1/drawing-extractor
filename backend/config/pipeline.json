@@ -164,7 +164,9 @@
     "spd_owner_heights": 32,
     "spd_class_gap_heights": 4,
     "box_side_gap_max": 15000.0,
-    "box_side_y_pad": 2000.0
+    "box_side_y_pad": 2000.0,
+    "caption_orphan_width": 22000.0,
+    "caption_orphan_height": 28000.0
   },
   "gates": {
     "_comment": "原生 CAD 提取结果进入流水线的准入条件；不达标即回退视觉大模型。",

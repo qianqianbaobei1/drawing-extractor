@@ -703,6 +703,10 @@ BOX_ABOVE_MIN, BOX_ABOVE_MAX = float(_CAD["box_above_min"]), float(_CAD["box_abo
 BOX_X_TOLERANCE = float(_CAD["box_x_tolerance"])       # 箱名与箱框水平中心的最大额外偏移
 BOX_SIDE_GAP_MAX = float(_CAD.get("box_side_gap_max") or 15000.0)  # 箱名在箱框左右侧时的最大缝隙
 BOX_SIDE_Y_PAD = float(_CAD.get("box_side_y_pad") or 2000.0)       # 侧旁配对允许的垂直越界
+CAPTION_ORPHAN_W = float(_CAD.get("caption_orphan_width") or 22000.0)
+CAPTION_ORPHAN_H = float(_CAD.get("caption_orphan_height") or 28000.0)
+BAD_LAYER_ALLOW_WITH_CODE = bool(_DOM.get("unit_caption_bad_layer_allow_with_code", True))
+INSIDE_CAPTION_BAND_RATIO = float(_DOM.get("unit_inside_caption_band_ratio") or 0.25)
 CROP_PAD_SIDE = float(_CAD["crop_pad_side"])
 CROP_PAD_TOP = float(_CAD["crop_pad_top"])
 CROP_PAD_BOTTOM = float(_CAD["crop_pad_bottom"])
@@ -1035,6 +1039,20 @@ def _caption_has_note_mark(text: str) -> bool:
     return any(m and m in compact for m in CAPTION_NOTE_MARKS)
 
 
+def _caption_layer_allowed(layer: str, text: str) -> bool:
+    """坏图层默认拒；若配置允许且能抽出箱号，放行 TEL_TAB 等表栏上的真箱名。
+
+    消控图常见：``03XF01消防配电箱 共1台`` 落在 TEL_TAB，而同框内「应急照明箱03ELB1」
+    在好图层却是框内负荷/关联标注——必须靠箱号+图层策略区分。
+    """
+    layer = str(layer or "")
+    if layer not in UNIT_CAPTION_BAD_LAYERS:
+        return True
+    if not BAD_LAYER_ALLOW_WITH_CODE:
+        return False
+    return bool(_caption_panel_code(text))
+
+
 def _looks_like_box_caption(text: str) -> bool:
     """箱名判定：标准后缀最长匹配；允许代号在后缀后；拒说明句与路由注释。
 
@@ -1296,13 +1314,17 @@ def _unit_rects(index: GeometryIndex, frame_rect) -> list[tuple[float, float, fl
     return rects
 
 
-def _match_box_rect(rects, cap) -> tuple[float, float, float, float] | None:
-    """给箱名找箱框：内含 → 正上方 → 左右侧旁（Y 重叠）。"""
+def _match_box_rect_with_kind(
+    rects, cap
+) -> tuple[tuple[float, float, float, float] | None, str | None]:
+    """给箱名找箱框，并返回配对方式。
+
+    优先级：框下（标准）→ 侧旁 → 框内底带。框内深处的负荷/关联名不得抢框
+    （消控图「应急照明箱03ELB1」写在 03XF01 虚线框内部）。
+    """
     cx, cy = cap["x"], cap["y"]
-    inside = [r for r in rects if r[0] <= cx <= r[2] and r[1] <= cy <= r[3]]
-    if inside:
-        return max(inside, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
-    cands = []
+    # 1) 箱名在框下方（或略伸入框底）
+    below = []
     for r in rects:
         dy = r[1] - cy
         if not BOX_ABOVE_MIN * -1 <= dy <= BOX_ABOVE_MAX:
@@ -1310,12 +1332,12 @@ def _match_box_rect(rects, cap) -> tuple[float, float, float, float] | None:
         half = (r[2] - r[0]) / 2.0 + BOX_X_TOLERANCE
         if abs(cx - (r[0] + r[2]) / 2.0) > half:
             continue
-        cands.append((abs(dy) if dy >= 0 else dy + 1e6, r))
-    if cands:
-        min_dy = min(c[0] for c in cands)
-        best_cands = [c[1] for c in cands if abs(c[0] - min_dy) < 500.0]
-        return max(best_cands, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
-    # 侧旁：箱名在框左右，垂直方向与框重叠（消控 03ELB1 等）
+        below.append((abs(dy) if dy >= 0 else dy + 1e6, r))
+    if below:
+        min_dy = min(c[0] for c in below)
+        best = [c[1] for c in below if abs(c[0] - min_dy) < 500.0]
+        return max(best, key=lambda r: (r[2] - r[0]) * (r[3] - r[1])), "below"
+    # 2) 侧旁
     side = []
     for r in rects:
         if not (r[1] - BOX_SIDE_Y_PAD <= cy <= r[3] + BOX_SIDE_Y_PAD):
@@ -1328,10 +1350,32 @@ def _match_box_rect(rects, cap) -> tuple[float, float, float, float] | None:
             continue
         if gap <= BOX_SIDE_GAP_MAX:
             side.append((gap, r))
-    if not side:
-        return None
-    side.sort(key=lambda x: (x[0], -(x[1][2] - x[1][0]) * (x[1][3] - x[1][1])))
-    return side[0][1]
+    if side:
+        side.sort(key=lambda x: (x[0], -(x[1][2] - x[1][0]) * (x[1][3] - x[1][1])))
+        return side[0][1], "side"
+    # 3) 框内底带（真箱名常靠下沿）
+    band = max(0.05, min(0.5, INSIDE_CAPTION_BAND_RATIO))
+    inside_band = []
+    inside_any = []
+    for r in rects:
+        if not (r[0] <= cx <= r[2] and r[1] <= cy <= r[3]):
+            continue
+        h = max(r[3] - r[1], 1e-6)
+        inside_any.append(r)
+        if cy <= r[1] + band * h:
+            inside_band.append(r)
+    if inside_band:
+        return max(inside_band, key=lambda r: (r[2] - r[0]) * (r[3] - r[1])), "inside"
+    # 4) 框内任意：仅兜底（大单箱外框内的箱名）；抢框时排序会让 below/side 优先
+    if inside_any:
+        return max(inside_any, key=lambda r: (r[2] - r[0]) * (r[3] - r[1])), "inside_deep"
+    return None, None
+
+
+def _match_box_rect(rects, cap) -> tuple[float, float, float, float] | None:
+    """给箱名找箱框：框下 → 侧旁 → 框内底带。"""
+    rect, _kind = _match_box_rect_with_kind(rects, cap)
+    return rect
 
 
 def _column_pitch(rects) -> float:
@@ -1511,21 +1555,27 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
             continue
 
         rects = _unit_rects(index, fbox)
-        captions = [t for t in texts
-                    if _looks_like_box_caption(t["text"])
-                    and t["layer"] not in UNIT_CAPTION_BAD_LAYERS]
+        captions = [
+            t for t in texts
+            if _looks_like_box_caption(t["text"]) and _caption_layer_allowed(t["layer"], t["text"])
+        ]
         scale = _guess_plot_scale(fbox[2] - fbox[0], fbox[3] - fbox[1])
         pitch_x = _column_pitch(rects)
         made = 0
         used: set[int] = set()
         matched_ids: set[int] = set()
-        # 带真实箱号的 caption 优先抢框，避免「XXM 照明配电箱」占走 03ELB1 的侧旁框
+        used_codes: set[str] = set()
+        # 配对方式优先于纯 Y：框下真箱名压过框内侧旁负荷名；带箱号压过 XXM 占位
+        kind_rank = {"below": 0, "side": 1, "inside": 2, "inside_deep": 3}
+
         def _cap_sort_key(t: dict[str, Any]):
+            _rect, kind = _match_box_rect_with_kind(rects, t)
             has_code = 1 if _caption_panel_code(t["text"]) else 0
-            return (-has_code, -t["y"], t["x"])
+            leading = 1 if _caption_leading_code(t["text"]) else 0
+            return (-has_code, kind_rank.get(kind or "", 9), -leading, -t["y"], t["x"])
 
         for cap in sorted(captions, key=_cap_sort_key):
-            rect = _match_box_rect(rects, cap)
+            rect, kind = _match_box_rect_with_kind(rects, cap)
             if rect is None or id(rect) in used:
                 continue
             crop = _cell_crop(rect, rects, fbox, cap["y"], pitch_x)
@@ -1544,10 +1594,47 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
                 "box_code": box_code or "",
                 "split_source": "unit",
                 "split_reason": "",
+                "match_kind": kind or "",
             })
             made += 1
             used.add(id(rect))
             matched_ids.add(id(cap))
+            if box_code:
+                used_codes.add(box_code.upper())
+
+        # 有箱号的真箱名配不上虚线框：合成 caption_orphan，不假装成几何单元，也不整框吞掉
+        for cap in captions:
+            if id(cap) in matched_ids:
+                continue
+            code = _caption_panel_code(cap["text"])
+            if not code or code.upper() in used_codes:
+                continue
+            cx, cy = float(cap["x"]), float(cap["y"])
+            crop = (
+                max(fbox[0], cx - CAPTION_ORPHAN_W * 0.35),
+                max(fbox[1], cy),
+                min(fbox[2], cx + CAPTION_ORPHAN_W * 0.65),
+                min(fbox[3], cy + CAPTION_ORPHAN_H),
+            )
+            if crop[2] - crop[0] < 1000 or crop[3] - crop[1] < 1000:
+                continue
+            cap_name = cap["text"].replace(" ", "")
+            long_units = max(crop[2] - crop[0], crop[3] - crop[1])
+            block_scale = max(long_units / UNIT_PAGE_LONG_MM, 1e-6)
+            blocks.append({
+                "rect": crop,
+                "label": f"{code} {cap_name}",
+                "frame": frame["title"],
+                "scale": block_scale,
+                "box_code": code,
+                "split_source": "caption_orphan",
+                "split_reason": "caption_without_unit_rect",
+                "match_kind": "orphan",
+            })
+            made += 1
+            matched_ids.add(id(cap))
+            used_codes.add(code.upper())
+
         missed = [t["text"] for t in captions if id(t) not in matched_ids]
         frame["missed_captions"] = missed
         if made:
@@ -1579,6 +1666,7 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
 def summarize_unit_split(frames: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> dict[str, Any]:
     """汇总单元块切分结果，供 read_report / 不确定性清单使用。"""
     unit_n = sum(1 for b in blocks if b.get("split_source") == "unit")
+    orphan_n = sum(1 for b in blocks if b.get("split_source") == "caption_orphan")
     fallback_n = sum(1 for b in blocks if b.get("split_source") == "frame_fallback")
     missed: list[str] = []
     for frame in frames:
@@ -1595,13 +1683,25 @@ def summarize_unit_split(frames: list[dict[str, Any]], blocks: list[dict[str, An
     uncertainties: list[str] = []
     if fallback_n:
         uncertainties.append(f"有 {fallback_n} 个图框未能拆成单元块，已整框降级（frame_fallback）")
+    if orphan_n:
+        uncertainties.append(
+            f"有 {orphan_n} 个带箱号箱名未配上虚线框，已按 caption_orphan 合成裁剪（非几何单元）"
+        )
     if missed_unique:
         sample = "、".join(missed_unique[:8])
         more = f" 等{len(missed_unique)}个" if len(missed_unique) > 8 else ""
         uncertainties.append(f"箱名未配上箱框：{sample}{more}")
+    geometric = unit_n + orphan_n
+    if geometric and not fallback_n:
+        mode = "unit" if not orphan_n else "mixed"
+    elif geometric:
+        mode = "mixed"
+    else:
+        mode = "frame_fallback"
     return {
-        "mode": "unit" if unit_n and not fallback_n else ("mixed" if unit_n else "frame_fallback"),
+        "mode": mode,
         "unit_blocks": unit_n,
+        "caption_orphans": orphan_n,
         "frame_fallbacks": fallback_n,
         "total_blocks": len(blocks),
         "missed_captions": missed_unique,

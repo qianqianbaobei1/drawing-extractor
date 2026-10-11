@@ -720,6 +720,48 @@ class TestEvidenceAndCatalogReconciler(unittest.TestCase):
         self.assertTrue(any("未检索到有效配电箱系统图标头" in t for t in uncertainty_texts))
 
 
+    def test_range_annotation_not_pretend_cut(self):
+        """DQHZ01~DQHZ05 等范围字展开进对账，缺失文案为「目录声明、图面未切出单元」。"""
+        from extractor.catalog_reconciler import (
+            expand_panel_range,
+            harvest_range_annotations,
+            DrawingCatalogReconciler,
+        )
+        self.assertEqual(
+            expand_panel_range("DQHZ01~DQHZ05"),
+            ["DQHZ01", "DQHZ02", "DQHZ03", "DQHZ04", "DQHZ05"],
+        )
+        items = harvest_range_annotations([
+            "DQHZ01~DQHZ05",
+            "XFJK01~XFJK03",
+            "配置详见各配电箱柜系统图",  # 应跳过
+            "很长的说明文字" * 20 + " DQHZ01~DQHZ05",
+        ])
+        kinds = {i.declaration_kind for i in items}
+        self.assertEqual(kinds, {"range_annotation"})
+        codes = set()
+        for i in items:
+            codes.update(i.declared_panels)
+        self.assertIn("DQHZ01", codes)
+        self.assertIn("XFJK01", codes)
+        recon = DrawingCatalogReconciler.reconcile(items, extracted_boxes=[])
+        self.assertGreater(recon.missing_count, 0)
+        for it in recon.items:
+            if it.declaration_kind == "range_annotation" and it.missing_panels:
+                self.assertIn("目录声明、图面未切出单元", it.note)
+        issues = DrawingCatalogReconciler.generate_reconciliation_issues(recon)
+        self.assertTrue(any("目录声明、图面未切出单元" in (u.detail or "") for u in issues))
+        self.assertTrue(all(u.severity != "ERROR" or "范围缺失" in (u.detail or "") for u in issues))
+        # range_annotation 应为 WARNING
+        range_issues = [u for u in issues if "目录声明、图面未切出单元" in (u.detail or "")]
+        self.assertTrue(range_issues)
+
+        self.assertTrue(all(u.severity == "WARNING" for u in range_issues))
+        # 管径范围不得进对账
+        noisy = harvest_range_annotations(["管径DN65到DN150", "DN65~DN150"])
+        self.assertEqual(noisy, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

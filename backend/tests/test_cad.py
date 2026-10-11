@@ -541,6 +541,49 @@ class TestUnitBlockSplitHardening(unittest.TestCase):
         self.assertEqual(blocks[0]["box_code"], "00ALZ")
 
 
+    def test_bad_layer_caption_with_code_builds_unit(self):
+        """TEL_TAB 上带箱号的真箱名应放行，且压过框内负荷名抢框。"""
+        from extractor.cad import GeometryIndex, build_unit_blocks, _caption_layer_allowed
+        self.assertTrue(_caption_layer_allowed("TEL_TAB", "03XF01消防配电箱 共1台,（挂墙明装）"))
+        self.assertFalse(_caption_layer_allowed("TEL_TAB", "A型应急照明集中电源配电箱"))  # 无箱号
+        doc, msp = self._frame_doc()
+        x, y = 5000, 35000
+        msp.add_lwpolyline([(x, y), (x + 15000, y), (x + 15000, y + 20000), (x, y + 20000)],
+                           close=True, dxfattribs={"layer": "SYST", "linetype": "DASHED2"})
+        # 框下真箱名在坏图层
+        msp.add_text("03XF01消防配电箱 共1台,（挂墙明装）",
+                     dxfattribs={"height": 300, "insert": (x + 2000, y - 1200), "layer": "TEL_TAB"})
+        # 框内深处负荷/关联名（好图层）不得抢走
+        msp.add_text("应急照明箱03ELB1", dxfattribs={
+            "height": 300, "insert": (x + 3000, y + 16000), "layer": "强电系统"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        coded = [b for b in blocks if b.get("box_code")]
+        self.assertTrue(any(b.get("box_code") == "03XF01" and b.get("split_source") == "unit" for b in coded))
+        # 03ELB1 框内深处不应抢走 03XF01 的几何单元
+        xf = next(b for b in coded if b.get("box_code") == "03XF01")
+        self.assertEqual(xf.get("split_source"), "unit")
+
+    def test_caption_orphan_when_no_unit_rect(self):
+        """有箱号箱名但无虚线框 → caption_orphan，不整框假切。"""
+        from extractor.cad import GeometryIndex, build_unit_blocks, summarize_unit_split
+        doc, msp = self._frame_doc()
+        msp.add_text("03ELB1 A型应急照明集中电源配电箱 共1台,（壁挂式）",
+                     dxfattribs={"height": 300, "insert": (20000, 20000), "layer": "TEL_TAB"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        # 给图框一个系统图标题，避免 plan skip；无 rect 时也应 orphan 而非仅 fallback
+        msp.add_text("配电系统图", dxfattribs={"height": 500, "insert": (5000, 80000), "layer": "图签栏"})
+        blocks = build_unit_blocks(doc, index, frames)
+        orphans = [b for b in blocks if b.get("split_source") == "caption_orphan"]
+        self.assertEqual(len(orphans), 1)
+        self.assertEqual(orphans[0]["box_code"], "03ELB1")
+        summary = summarize_unit_split(frames, blocks)
+        self.assertGreaterEqual(summary.get("caption_orphans", 0), 1)
+        self.assertTrue(any("caption_orphan" in u for u in summary["uncertainties"]))
+
+
 class TestDwgConversionGuard(unittest.TestCase):
     """DWG 转 DXF 只认本图产物，坏文件不能冒充另一张配电箱图。"""
 

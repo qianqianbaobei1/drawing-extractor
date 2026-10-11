@@ -139,6 +139,8 @@
       "图签栏",
       "DIM-照明"
     ],
+    "unit_caption_bad_layer_allow_with_code": true,
+    "unit_inside_caption_band_ratio": 0.25,
     "unit_rect_bad_layer_markers": [
       "EQUIP",
       "WIRE",

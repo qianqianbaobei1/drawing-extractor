@@ -568,6 +568,7 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
         result = assemble(raw, meta)
 
         if cad_texts and not getattr(result, "reconciliation", None):
+            from extractor.catalog_reconciler import harvest_range_annotations
             seen_cat = set()
             cat_items = []
             for t in cad_texts:
@@ -578,6 +579,11 @@ def process_cad_raw_extraction(job_id: str, pdf_path: str, filename: str, raw: R
                     if key not in seen_cat:
                         seen_cat.add(key)
                         cat_items.append(parsed)
+            for item in harvest_range_annotations(t.get("text", "") for t in cad_texts):
+                key = ("range", item.sheet_title)
+                if key not in seen_cat:
+                    seen_cat.add(key)
+                    cat_items.append(item)
             if cat_items:
                 result.reconciliation = DrawingCatalogReconciler.reconcile(
                     cat_items, result.boxes, source_name="CAD图纸目录"
@@ -740,6 +746,7 @@ def process_pdf(job_id: str, pdf_path: str, filename: str):
         result = assemble(raw, meta)
 
         if cad_texts and not getattr(result, "reconciliation", None):
+            from extractor.catalog_reconciler import harvest_range_annotations
             seen_cat = set()
             cat_items = []
             for t in cad_texts:
@@ -750,6 +757,11 @@ def process_pdf(job_id: str, pdf_path: str, filename: str):
                     if key not in seen_cat:
                         seen_cat.add(key)
                         cat_items.append(parsed)
+            for item in harvest_range_annotations(t.get("text", "") for t in cad_texts):
+                key = ("range", item.sheet_title)
+                if key not in seen_cat:
+                    seen_cat.add(key)
+                    cat_items.append(item)
             if cat_items:
                 result.reconciliation = DrawingCatalogReconciler.reconcile(
                     cat_items, result.boxes, source_name="图纸目录"
