@@ -344,6 +344,100 @@ class TestCADPipeline(unittest.TestCase):
         self.assertEqual(frames[0]["bbox"], (0.0, 0.0, 118900.0, 84100.0))
 
 
+
+class TestUnitBlockSplitHardening(unittest.TestCase):
+    """单元块切分加固：无标准后缀箱名、整框降级告警、回路号不当 box_code、未标 closed 的箱框。"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _frame_doc(self):
+        doc = ezdxf.new("R2010")
+        frame_blk = doc.blocks.new("横式A0")
+        frame_blk.add_lwpolyline([(0, 0), (118900, 0), (118900, 84100), (0, 84100)], close=True)
+        msp = doc.modelspace()
+        msp.add_blockref("横式A0", insert=(0, 0))
+        msp.add_text("配电系统图(一)", dxfattribs={"height": 400, "insert": (2000, 2000), "layer": "图签栏"})
+        return doc, msp
+
+    def test_nonstandard_suffix_caption_builds_unit(self):
+        from extractor.cad import GeometryIndex, build_unit_blocks, _looks_like_box_caption
+        self.assertTrue(_looks_like_box_caption("01AL1 照明箱"))
+        self.assertTrue(_looks_like_box_caption("AP2动力箱"))
+        self.assertFalse(_looks_like_box_caption("配电系统图(一)"))
+        self.assertFalse(_looks_like_box_caption("由AL1引至本层"))
+
+        doc, msp = self._frame_doc()
+        x, y = 5000, 35000
+        msp.add_lwpolyline([(x, y), (x + 15000, y), (x + 15000, y + 20000), (x, y + 20000)],
+                           close=True, dxfattribs={"layer": "强电系统", "linetype": "DASHED2"})
+        msp.add_text("01AL1 照明箱", dxfattribs={"height": 300, "insert": (x + 2000, 33800), "layer": "强电系统"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["split_source"], "unit")
+        self.assertEqual(blocks[0]["box_code"], "01AL1")
+
+    def test_frame_fallback_is_explicit(self):
+        from extractor.cad import GeometryIndex, build_unit_blocks, summarize_unit_split
+        doc, msp = self._frame_doc()
+        # 只有系统图标题，没有箱名/箱框 → 整框降级
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["split_source"], "frame_fallback")
+        self.assertTrue(blocks[0].get("split_reason"))
+        summary = summarize_unit_split(frames, blocks)
+        self.assertEqual(summary["frame_fallbacks"], 1)
+        self.assertTrue(any("整框降级" in u or "frame_fallback" in u for u in summary["uncertainties"]))
+
+    def test_circuit_number_not_used_as_box_code(self):
+        from extractor.cad import GeometryIndex, build_unit_blocks, _extract_unit_box_code
+        # 回路号不能抢码；caption 前缀 01B-03 应保留
+        self.assertEqual(_extract_unit_box_code([
+            {"text": "AL1-1", "x": 0, "y": 0},
+            {"text": "WL1", "x": 1, "y": 0},
+        ], caption="01B-03 动力配电箱"), "01B-03")
+        self.assertEqual(_extract_unit_box_code([
+            {"text": "AL1-1", "x": 0, "y": 0},
+            {"text": "2SAL1 照明配电箱", "x": 1, "y": 0},
+        ], caption="2SAL1 照明配电箱"), "2SAL1")
+
+        doc, msp = self._frame_doc()
+        x, y = 5000, 35000
+        msp.add_lwpolyline([(x, y), (x + 15000, y), (x + 15000, y + 20000), (x, y + 20000)],
+                           close=True, dxfattribs={"layer": "强电系统", "linetype": "DASHED2"})
+        msp.add_text("01B-03 动力配电箱", dxfattribs={"height": 300, "insert": (x + 2000, 33800), "layer": "强电系统"})
+        msp.add_text("AL1-1", dxfattribs={"height": 200, "insert": (x + 3000, y + 15000), "layer": "强电系统"})
+        msp.add_text("WL1", dxfattribs={"height": 200, "insert": (x + 3000, y + 12000), "layer": "强电系统"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["box_code"], "01B-03")
+        self.assertNotIn(blocks[0]["box_code"], {"AL1-1", "WL1"})
+
+    def test_unclosed_endpoint_unit_rect_accepted(self):
+        from extractor.cad import GeometryIndex, build_unit_blocks, _polyline_is_closed
+        doc, msp = self._frame_doc()
+        x, y = 5000, 35000
+        # 首尾重合但 close=False
+        pts = [(x, y), (x + 15000, y), (x + 15000, y + 20000), (x, y + 20000), (x, y)]
+        pl = msp.add_lwpolyline(pts, close=False, dxfattribs={"layer": "强电系统", "linetype": "DASHED2"})
+        self.assertTrue(_polyline_is_closed(pl))
+        msp.add_text("01AP1 动力配电箱", dxfattribs={"height": 300, "insert": (x + 2000, 33800), "layer": "强电系统"})
+        index = GeometryIndex(doc)
+        frames = [{"bbox": (0.0, 0.0, 118900.0, 84100.0), "block": "横式A0", "source": "insert"}]
+        blocks = build_unit_blocks(doc, index, frames)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["split_source"], "unit")
+
+
 class TestDwgConversionGuard(unittest.TestCase):
     """DWG 转 DXF 只认本图产物，坏文件不能冒充另一张配电箱图。"""
 

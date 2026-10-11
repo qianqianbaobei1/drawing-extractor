@@ -40,9 +40,23 @@
       "配电屏",
       "开关箱",
       "电源箱",
-      "总箱"
+      "总箱",
+      "照明箱",
+      "动力箱",
+      "控制柜",
+      "动力柜",
+      "切换箱",
+      "计量箱",
+      "照明柜",
+      "配电箱柜"
     ],
-    "caption_route_marks": ["由", "引", "至", "沿", "敷设"],
+    "caption_route_marks": [
+      "由",
+      "引",
+      "至",
+      "沿",
+      "敷设"
+    ],
     "wire_kind_words": [
       "信号线",
       "电源线",
@@ -72,9 +86,17 @@
     ],
     "spd_class_regex": "^(?:I{1,3}|Ⅰ|Ⅱ|Ⅲ)级[-/]?[1-4]P$",
     "row_device_families": {
-      "contactor": ["(?<![A-Z0-9])LC1(?:-[A-Z]|D)"],
-      "thermal": ["(?<![A-Z0-9])LRD[-\\s]", "(?<![A-Z0-9])LDR[-\\s]", "(?<![A-Z0-9])LR9[-\\s]"],
-      "ct": ["(?<![A-Z0-9])BH-0\\.66"]
+      "contactor": [
+        "(?<![A-Z0-9])LC1(?:-[A-Z]|D)"
+      ],
+      "thermal": [
+        "(?<![A-Z0-9])LRD[-\\s]",
+        "(?<![A-Z0-9])LDR[-\\s]",
+        "(?<![A-Z0-9])LR9[-\\s]"
+      ],
+      "ct": [
+        "(?<![A-Z0-9])BH-0\\.66"
+      ]
     },
     "thermal_setting_regex": "^\\d+~\\d+A$",
     "table_field_labels": [
@@ -208,7 +230,17 @@
       "传感模块",
       "测控装置",
       "电源监控"
-    ]
+    ],
+    "caption_strip_marks": [
+      "系统图",
+      "接线图",
+      "原理图",
+      "干线图",
+      "拓扑图",
+      "结线图"
+    ],
+    "caption_bad_head_chars": "由详注如按本除并引至沿",
+    "caption_soft_tail_chars": "箱柜屏盘"
   },
   "breaker": {
     "_comment": "断路器型号词法与分类。category_prefixes 按顺序精确匹配型号开头；category_rules 按顺序做包含/前缀判定。",
@@ -437,7 +469,17 @@
     ],
     "laying_method_regex": "(?:-|/|\\s|^)((?:SC|PC|KBG|JDG|CT|MR|PR|CP|RC|PVC)\\d{0,3}(?:[/-](?:CC|WC|FC|WS|CE|ACC|SR|MR|CT|WE))*)\\b",
     "default_laying": "未标注",
-    "inline_markers": ["BV", "BVR", "BYJ", "YJV", "YJY", "RVV", "KVV", "WDZ", "BBTRZ"]
+    "inline_markers": [
+      "BV",
+      "BVR",
+      "BYJ",
+      "YJV",
+      "YJY",
+      "RVV",
+      "KVV",
+      "WDZ",
+      "BBTRZ"
+    ]
   },
   "review": {
     "confirmed_prefix": "（已确认）",
@@ -602,7 +644,11 @@
       "二次接线"
     ],
     "link_pattern_template": "(?:^|至|送|往|引至|供|接|配电箱|\\b){code}(?:配电箱|分箱|箱|柜|照明箱|动力箱|\\b|$|\\s)",
-    "upstream_unnamed_markers": ["上级", "引自", "引来"],
+    "upstream_unnamed_markers": [
+      "上级",
+      "引自",
+      "引来"
+    ],
     "upstream_unnamed_note": "上级箱号未在图中标明"
   }
 }

@@ -244,6 +244,7 @@ def build_read_report(
     converter: str,
     dxf_path: str | None = None,
     recovered: bool = False,
+    split: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     conversion = conversion_for(source_path) or conversion_for(dxf_path)
     if converter == "native_dxf":
@@ -373,6 +374,14 @@ def build_read_report(
         "recovered": recovered,
     }
     status, reasons, measurement_allowed = classify_read_status(facts)
+    split_info = split or {}
+    for note in split_info.get("uncertainties") or []:
+        if note and note not in reasons:
+            # 切分降级不单独改 supported→degraded，但必须写进 reasons 避免静默
+            if split_info.get("mode") in {"geometry_failed", "frame_fallback", "sheet_fallback", "page_fallback", "mixed", "no_frames"}:
+                if status == STATUS_SUPPORTED and split_info.get("mode") in {"geometry_failed", "frame_fallback", "mixed"}:
+                    status = STATUS_DEGRADED
+            reasons.append(note)
     return {
         "file_sha256": file_hash,
         "file_name": os.path.basename(source_path),
@@ -407,6 +416,8 @@ def build_read_report(
             "柜内线、铜排和辅材没有装配依据时不补数量",
             "覆盖率保持为空，未做盲测前不写准确率",
         ],
+        "split": split or {},
+        "uncertainties": list((split or {}).get("uncertainties") or []),
     }
 
 

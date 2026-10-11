@@ -677,12 +677,18 @@ RENDER_FALLBACK_PAGE = tuple(_CAD["render_fallback_page"])
 DWG2DXF_SEARCH_PATHS = tuple(_CAD["dwg2dxf_search_paths"])
 DWG2SVG_SEARCH_PATHS = tuple(_CAD["dwg2svg_search_paths"])
 CONVERT_TIMEOUT_S = int(_CAD["convert_timeout_s"])
-UNIT_CAPTION_SUFFIX = tuple(_DOM["unit_caption_suffix"])
+UNIT_CAPTION_SUFFIX = tuple(
+    sorted(_DOM["unit_caption_suffix"], key=len, reverse=True)
+)  # 最长后缀优先，避免「配电箱」抢走「照明配电箱」一类复合后缀
 UNIT_CAPTION_MIN_LEN = int(_DOM["box_caption_min_len"])
 UNIT_CAPTION_MAX_LEN = int(_DOM["box_caption_max_len"])
 BOX_TITLE_MAX_LEN = int(_DOM["box_title_max_len"])
 NOTE_TEXT_MAX_LEN = int(_DOM["note_text_max_len"])
 UNIT_CAPTION_BAD_LAYERS = set(_DOM["unit_caption_bad_layers"])
+CAPTION_ROUTE_MARKS = tuple(_DOM.get("caption_route_marks") or ("由", "引", "至", "沿", "敷设"))
+CAPTION_STRIP_MARKS = tuple(_DOM.get("caption_strip_marks") or ("系统图", "接线图", "原理图"))
+CAPTION_BAD_HEAD_CHARS = str(_DOM.get("caption_bad_head_chars") or "由详注如按本除并引至沿")
+CAPTION_SOFT_TAIL_CHARS = str(_DOM.get("caption_soft_tail_chars") or "箱柜屏盘")
 # 平面图/建筑图层上也有闭合箱柜外形，但不是系统图单元块，按图层前缀排掉
 UNIT_RECT_BAD_LAYER_MARKERS = tuple(_DOM["unit_rect_bad_layer_markers"])
 BOX_ABOVE_MIN, BOX_ABOVE_MAX = float(_CAD["box_above_min"]), float(_CAD["box_above_max"])
@@ -893,25 +899,7 @@ def detect_drawing_frames(doc: Any, index: GeometryIndex) -> list[dict[str, Any]
             e = index.entities[i]
             if e.dxftype() not in ("LWPOLYLINE", "POLYLINE"):
                 continue
-            is_closed = False
-            try:
-                if e.dxftype() == "LWPOLYLINE":
-                    if e.closed:
-                        is_closed = True
-                    else:
-                        pts = e.get_points("xy")
-                        if len(pts) >= 4 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < POLYLINE_CLOSE_TOL:
-                            is_closed = True
-                else:
-                    if e.is_closed:
-                        is_closed = True
-                    else:
-                        pts = list(e.points())
-                        if len(pts) >= 4 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < POLYLINE_CLOSE_TOL:
-                            is_closed = True
-            except Exception:
-                continue
-            if not is_closed:
+            if not _polyline_is_closed(e):
                 continue
             b = index.boxes[i]
             w, h = b[2] - b[0], b[3] - b[1]
@@ -972,12 +960,60 @@ def _guess_plot_scale(w: float, h: float) -> float:
     return scale
 
 
+def _normalize_box_caption(text: str) -> str:
+    """去掉空格、括号修饰与「系统图」等图类尾巴，便于后缀匹配。"""
+    t = re.sub(r"\s+", "", (text or "").strip())
+    t = re.sub(r"[（(][^）)]*[）)]", "", t)
+    for mark in CAPTION_STRIP_MARKS:
+        if mark and mark in t:
+            t = t.replace(mark, "")
+    return t.strip(" -_/、，,")
+
+
+def _caption_suffix_match(text: str) -> str | None:
+    for sfx in UNIT_CAPTION_SUFFIX:
+        if text.endswith(sfx):
+            return sfx
+    return None
+
+
+def _caption_has_route_note(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return True
+    if raw[0] in CAPTION_BAD_HEAD_CHARS:
+        return True
+    return any(mark and raw.startswith(mark) for mark in CAPTION_ROUTE_MARKS)
+
+
 def _looks_like_box_caption(text: str) -> bool:
-    t = (text or "").strip()
-    if not UNIT_CAPTION_MIN_LEN <= len(t) <= UNIT_CAPTION_MAX_LEN or not t.endswith(UNIT_CAPTION_SUFFIX):
+    """箱名判定：标准后缀最长匹配；无标准后缀时允许「代号+箱/柜/屏/盘」。
+
+    图名（系统图/平面图等）且抽不出箱号时不当箱名；「由/引…」路由注释直接拒绝。
+    """
+    raw = (text or "").strip()
+    if not raw or _caption_has_route_note(raw):
         return False
-    head = t[:-3].strip()
-    return bool(head) and head[0] not in "由详注如按本除并"
+    compact = re.sub(r"\s+", "", raw)
+    # 纯图名：带系统图/平面图类词且没有箱种后缀 → 不是箱名
+    title_like = any(m in compact for m in SYSTEM_TITLE_MARKERS) or any(m in compact for m in PLAN_TITLE_MARKERS)
+    t = _normalize_box_caption(raw)
+    if not UNIT_CAPTION_MIN_LEN <= len(t) <= UNIT_CAPTION_MAX_LEN:
+        return False
+    sfx = _caption_suffix_match(t)
+    if sfx:
+        head = t[: -len(sfx)].strip(" -_/")
+        if not head or head[0] in CAPTION_BAD_HEAD_CHARS:
+            return False
+        return True
+    if title_like:
+        return False
+    # 软匹配：以箱/柜/屏/盘结尾，且前面有字母数字代号
+    if t and t[-1] in CAPTION_SOFT_TAIL_CHARS:
+        head = t[:-1].strip(" -_/")
+        if head and re.search(r"[A-Za-z0-9]", head) and head[0] not in CAPTION_BAD_HEAD_CHARS:
+            return True
+    return False
 
 
 def _frame_texts(index: GeometryIndex, rect, cached: dict) -> list[dict[str, Any]]:
@@ -1156,17 +1192,39 @@ def _classify_frame(title: str) -> str:
     return "other"
 
 
+def _polyline_is_closed(entity: Any) -> bool:
+    """闭合标志为真，或首尾点在容差内重合，都算闭合。
+
+    现场 DWG 里不少箱框是「画回起点但未勾 closed」的 LWPOLYLINE/POLYLINE，
+    只认 closed 标志会整段丢掉单元块。
+    """
+    kind = entity.dxftype()
+    try:
+        if kind == "LWPOLYLINE":
+            if bool(getattr(entity, "closed", False)):
+                return True
+            pts = list(entity.get_points("xy"))
+        elif kind == "POLYLINE":
+            if bool(getattr(entity, "is_closed", False)) or bool(getattr(entity.dxf, "flags", 0) & 1):
+                return True
+            pts = [(float(p[0]), float(p[1])) for p in entity.points()]
+        else:
+            return False
+        if len(pts) < 4:
+            return False
+        return math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < POLYLINE_CLOSE_TOL
+    except Exception:
+        return False
+
+
 def _unit_rects(index: GeometryIndex, frame_rect) -> list[tuple[float, float, float, float]]:
     """图框内所有配电箱虚线箱框（小尺寸闭合多段线），已按近似重复去重。"""
     rects: list[tuple[float, float, float, float]] = []
     for i in index.query(frame_rect):
         e = index.entities[i]
-        if e.dxftype() != "LWPOLYLINE":
+        if e.dxftype() not in ("LWPOLYLINE", "POLYLINE"):
             continue
-        try:
-            if not e.closed:
-                continue
-        except Exception:
+        if not _polyline_is_closed(e):
             continue
         layer = str(e.dxf.layer or "").upper()
         if any(m in layer for m in UNIT_RECT_BAD_LAYER_MARKERS):
@@ -1263,28 +1321,70 @@ def _cell_crop(rect, rects, frame, caption_y: float, pitch_x: float) -> tuple[fl
     return (max(frame[0], x0 - CROP_PAD_SIDE), bottom, right, top)
 
 
-def _extract_unit_box_code(crop_texts: list[dict[str, Any]]) -> str | None:
-    """从单元块文本中提取配电箱编号（如 2SAL1, SAW1）。"""
+def _looks_like_circuit_code(code: str) -> bool:
+    """回路号/支路号不当箱号：WL/WP… 或 AL1-1 / 1AL1-1 这类带支路后缀。"""
+    from .cad_extractor import _text_is_circuit_anchor
+    raw = (code or "").strip()
+    if not raw:
+        return True
+    if _text_is_circuit_anchor(raw):
+        return True
+    # 箱号后再挂 -数字 支路（AL1-1、2SAL1-3）；纯箱号 01B-03 保留
+    if re.fullmatch(r"\d*[A-Za-z]{2,}\d+[A-Za-z]?-\d+[A-Za-z]?", raw):
+        return True
+    if re.fullmatch(r"(?:WL|WP|WX|WD|WS|WY|WE|QF)\d+[A-Za-z]?", raw, re.I):
+        return True
+    return False
+
+
+def _caption_leading_code(caption: str) -> str | None:
+    """从箱名开头抽出代号，兼容 01B-03 / 2SAL1 / AL1 等 caption 前缀。"""
     from .cad_extractor import extract_panel_code
+    raw = re.sub(r"\s+", " ", (caption or "").strip())
+    if not raw:
+        return None
+    # 优先走统一词法
+    code = extract_panel_code(raw)
+    if code and not _looks_like_circuit_code(code):
+        return code
+    # 前缀兜底：开头连续字母数字与短横线，碰到中文/空白停下
+    m = re.match(r"^([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)", re.sub(r"\s+", "", raw))
+    if not m:
+        return None
+    token = m.group(1).upper()
+    if _looks_like_circuit_code(token):
+        return None
+    # 至少含一个字母和一个数字，避免把「一层」拼音残片当箱号
+    if re.search(r"[A-Z]", token) and re.search(r"\d", token):
+        return token
+    return None
+
+
+def _extract_unit_box_code(crop_texts: list[dict[str, Any]], caption: str | None = None) -> str | None:
+    """从单元块文本中提取配电箱编号；caption 优先，拒绝回路号抢码。"""
+    from .cad_extractor import extract_panel_code
+    if caption:
+        code = _caption_leading_code(caption)
+        if code:
+            return code
     for t in crop_texts:
         txt = t.get("text", "")
         if "设备编号" in txt or "箱体编号" in txt:
             clean = txt.replace("设备编号", "").replace("箱体编号", "").replace(":", "").replace("：", "").strip()
             if clean:
                 c = extract_panel_code(clean)
-                if c:
+                if c and not _looks_like_circuit_code(c):
                     return c
-            # 横向相邻单元格文字
             nearby = [t2 for t2 in crop_texts if abs(t2["y"] - t["y"]) < 600 and t2["x"] > t["x"]]
             if nearby:
                 nearby.sort(key=lambda t2: t2["x"])
                 for n in nearby:
                     c = extract_panel_code(n.get("text", ""))
-                    if c:
+                    if c and not _looks_like_circuit_code(c):
                         return c
     for t in crop_texts:
         c = extract_panel_code(t.get("text", ""))
-        if c:
+        if c and not _looks_like_circuit_code(c):
             return c
     return None
 
@@ -1298,6 +1398,7 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
 
     图框是否算系统图，由内容判定而不是靠图名猜：框里有“箱名 + 箱框”配对才算，
     一个都配不上、且图名也不是系统图类的图框（平面图、图签注释块等）整张丢掉。
+    配不上但图名是系统图时，整框降级并显式标记 split_source=frame_fallback。
     """
     text_cache: dict = {}
     blocks: list[dict[str, Any]] = []
@@ -1306,6 +1407,8 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
         texts = _frame_texts(index, fbox, text_cache)
         frame["title"] = _frame_title(texts)
         if _classify_frame(frame["title"]) == "plan":
+            frame["kind"] = "plan"
+            frame["missed_captions"] = []
             continue
 
         rects = _unit_rects(index, fbox)
@@ -1316,31 +1419,90 @@ def build_unit_blocks(doc: Any, index: GeometryIndex, frames: list[dict[str, Any
         pitch_x = _column_pitch(rects)
         made = 0
         used: set[int] = set()
+        matched_ids: set[int] = set()
         for cap in sorted(captions, key=lambda t: (-t["y"], t["x"])):
             rect = _match_box_rect(rects, cap)
             if rect is None or id(rect) in used:
                 continue
             crop = _cell_crop(rect, rects, fbox, cap["y"], pitch_x)
             crop_texts = _frame_texts(index, crop, text_cache, block_text=True)
-            box_code = _extract_unit_box_code(crop_texts)
+            box_code = _extract_unit_box_code(crop_texts, caption=cap["text"])
             cap_name = cap["text"].replace(" ", "")
             label = f"{box_code} {cap_name}" if box_code else cap_name
 
             long_units = max(crop[2] - crop[0], crop[3] - crop[1])
             block_scale = max(long_units / UNIT_PAGE_LONG_MM, 1e-6)
-            blocks.append({"rect": crop, "label": label, "frame": frame["title"],
-                           "scale": block_scale, "box_code": box_code or ""})
+            blocks.append({
+                "rect": crop,
+                "label": label,
+                "frame": frame["title"],
+                "scale": block_scale,
+                "box_code": box_code or "",
+                "split_source": "unit",
+                "split_reason": "",
+            })
             made += 1
             used.add(id(rect))
+            matched_ids.add(id(cap))
+        missed = [t["text"] for t in captions if id(t) not in matched_ids]
+        frame["missed_captions"] = missed
         if made:
             frame["kind"] = "system"
         elif _classify_frame(frame["title"]) == "system":
             frame["kind"] = "system"
-            blocks.append({"rect": fbox, "label": frame["title"] or "系统图",
-                           "frame": frame["title"], "scale": scale, "box_code": ""})
+            reason = "no_caption_rect_pair"
+            if captions and not rects:
+                reason = "captions_without_unit_rects"
+            elif captions:
+                reason = "captions_unmatched_to_rects"
+            elif not captions and not rects:
+                reason = "no_captions_or_rects"
+            blocks.append({
+                "rect": fbox,
+                "label": frame["title"] or "系统图",
+                "frame": frame["title"],
+                "scale": scale,
+                "box_code": "",
+                "split_source": "frame_fallback",
+                "split_reason": reason,
+                "missed_captions": missed,
+            })
         else:
             frame["kind"] = "skip"
     return blocks
+
+
+def summarize_unit_split(frames: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    """汇总单元块切分结果，供 read_report / 不确定性清单使用。"""
+    unit_n = sum(1 for b in blocks if b.get("split_source") == "unit")
+    fallback_n = sum(1 for b in blocks if b.get("split_source") == "frame_fallback")
+    missed: list[str] = []
+    for frame in frames:
+        missed.extend(frame.get("missed_captions") or [])
+    for block in blocks:
+        missed.extend(block.get("missed_captions") or [])
+    # 保序去重
+    seen: set[str] = set()
+    missed_unique: list[str] = []
+    for item in missed:
+        if item not in seen:
+            seen.add(item)
+            missed_unique.append(item)
+    uncertainties: list[str] = []
+    if fallback_n:
+        uncertainties.append(f"有 {fallback_n} 个图框未能拆成单元块，已整框降级（frame_fallback）")
+    if missed_unique:
+        sample = "、".join(missed_unique[:8])
+        more = f" 等{len(missed_unique)}个" if len(missed_unique) > 8 else ""
+        uncertainties.append(f"箱名未配上箱框：{sample}{more}")
+    return {
+        "mode": "unit" if unit_n and not fallback_n else ("mixed" if unit_n else "frame_fallback"),
+        "unit_blocks": unit_n,
+        "frame_fallbacks": fallback_n,
+        "total_blocks": len(blocks),
+        "missed_captions": missed_unique,
+        "uncertainties": uncertainties,
+    }
 
 
 def _render_block_pdf(doc: Any, index: GeometryIndex, block: dict[str, Any], ctx: RenderContext,
@@ -1383,7 +1545,9 @@ def render_cad_unit_blocks(doc: Any, blocks: list[dict[str, Any]], out_pdf_path:
                 texts.append({"type": "TEXT", "text": t["text"], "x": round(t["x"], 1),
                               "y": round(t["y"], 1), "page": idx, "sheet": block["label"],
                               "box_code": block.get("box_code") or "",
-                              "layer": t["layer"]})
+                              "layer": t["layer"],
+                              "split_source": block.get("split_source") or "unit",
+                              "split_reason": block.get("split_reason") or ""})
     finally:
         combined.save(out_pdf_path)
         combined.close()
@@ -1561,6 +1725,20 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
     dxf_to_clean = None
     converter = "native_dxf"
     dxf_path = cad_path
+    split_summary: dict[str, Any] = {
+        "mode": "unset",
+        "unit_blocks": 0,
+        "frame_fallbacks": 0,
+        "total_blocks": 0,
+        "missed_captions": [],
+        "uncertainties": [],
+    }
+
+    def _stamp_split(texts: list[dict[str, Any]], source: str, reason: str = "") -> None:
+        for rec in texts:
+            rec.setdefault("split_source", source)
+            if reason and not rec.get("split_reason"):
+                rec["split_reason"] = reason
 
     def _deliver(texts: list[dict[str, Any]], doc: Any, used_converter: str) -> tuple[str, list[dict[str, Any]]]:
         stamp_records(texts, cad_path)
@@ -1570,6 +1748,7 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
             converter=used_converter,
             dxf_path=dxf_path if used_converter != "svg_fallback" else None,
             recovered=bool(getattr(doc, "extractor_recovered", False)) if doc is not None else False,
+            split=split_summary,
         )
         write_read_report(out_pdf_path, report)
         return out_pdf_path, texts
@@ -1611,18 +1790,37 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
             frames = detect_drawing_frames(doc, index)
             if frames:
                 blocks = build_unit_blocks(doc, index, frames)
+                split_summary.update(summarize_unit_split(frames, blocks))
                 if blocks:
                     extracted_texts = render_cad_unit_blocks(doc, blocks, out_pdf_path, index)
                     if os.path.exists(out_pdf_path) and os.path.getsize(out_pdf_path) > 0:
                         return _deliver(extracted_texts, doc, converter)
+                split_summary.setdefault("uncertainties", []).append(
+                    "几何分幅未产出可渲染单元块，回退标题切片/整图"
+                )
+            else:
+                split_summary.update({
+                    "mode": "no_frames",
+                    "uncertainties": ["未检测到图框，回退标题切片/整图"],
+                })
         except Exception as exc:  # noqa: BLE001 - 几何分幅异常时退回旧链路，不能让上传直接失败
             print(f"[CAD] 几何分幅失败，回退旧切片链路: {exc}")
+            split_summary.update({
+                "mode": "geometry_failed",
+                "uncertainties": [f"几何分幅异常，已回退：{exc}"],
+            })
 
         # 2. 旧链路：按图签标题文字切分
         system_sheets = detect_system_sheets(doc)
         if len(system_sheets) >= 1:
             extracted_texts = slice_and_render_cad_sheets(doc, system_sheets, out_pdf_path)
             if os.path.exists(out_pdf_path) and os.path.getsize(out_pdf_path) > 0:
+                _stamp_split(extracted_texts, "sheet_fallback", split_summary.get("mode", "sheet_fallback"))
+                if split_summary.get("mode") in {"unset", "no_frames", "geometry_failed", "frame_fallback"}:
+                    split_summary["mode"] = "sheet_fallback"
+                split_summary.setdefault("uncertainties", []).append(
+                    f"已使用标题切片回退，共 {len(system_sheets)} 个系统图幅面"
+                )
                 return _deliver(extracted_texts, doc, converter)
 
         # 3. 若未探测出系统图分幅图框，检查是否属于不包含系统图的海量平面施工图
@@ -1639,6 +1837,9 @@ def process_cad_file(cad_path: str, out_pdf_path: str) -> tuple[str, list[dict[s
         ok = render_dxf_to_pdf(dxf_path, out_pdf_path, doc=doc)
         if not ok:
             raise RuntimeError("CAD 渲染为 PDF 失败")
+        _stamp_split(extracted_texts, "page_fallback", "full_page_render")
+        split_summary["mode"] = "page_fallback"
+        split_summary.setdefault("uncertainties", []).append("未检出系统图分幅，已整图渲染")
         return _deliver(extracted_texts, doc, converter)
     finally:
         if dxf_to_clean:
